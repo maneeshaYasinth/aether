@@ -10,14 +10,6 @@ This is a follow-up to [GuardRail](#), a secure CI/CD pipeline for AWS infrastru
 
 ---
 
-## Why this project exists
-
-Built following advice from a Senior Cloud Engineer at Sysco LABS on what makes a cloud engineering portfolio stand out:
-- Understand AWS services deeply, and combine multiple services in real projects — not toy single-service demos
-- Get real hands-on Linux/Kubernetes experience, not just theory
-- Include proper Git/CI-CD practice
-- Incorporate security and AI meaningfully, not as an afterthought
-
 ## Architecture
 
 ```
