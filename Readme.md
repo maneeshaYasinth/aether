@@ -6,7 +6,7 @@ Aether provisions Kubernetes clusters (locally and on AWS EKS), deploys workload
 
 This is a follow-up to [GuardRail](#), a secure CI/CD pipeline for AWS infrastructure (Terraform + tfsec + AI-generated security summaries). Aether takes the same "AI reads real signal and explains it in plain English" idea further: from *explaining findings* to *recommending changes*.
 
-> **Status:** Phase 1 complete (local GitOps loop). Phase 2 (EKS) in progress.
+> **Status:** Phase 1 complete (local GitOps loop). Phase 2 complete (EKS cluster and Argo CD deployed in AWS).
 
 ---
 
@@ -128,15 +128,36 @@ kubectl get applications -n argocd
 - App-of-apps pattern: `root-app` watches `gitops/apps/`, automatically picking up and deploying any Application manifest added there — adding a new app to the platform means committing one YAML file, nothing more.
 - **Self-healing**, demonstrated by deliberately drifting the cluster (`kubectl scale --replicas=5` against a git-declared `replicas: 1`) and watching ArgoCD detect and revert the drift automatically, with no manual intervention.
 
-## Phase 2: EKS (cloud) — in progress
+## Phase 2: EKS (cloud) — done
 
-Provisioning the same GitOps setup on AWS EKS, proving the platform is genuinely multi-cloud rather than k3s-specific. Networking module (VPC, EKS-tagged subnets, NAT) drafted; `eks-cluster` module and AWS credentials setup next.
+The same platform is now running on AWS EKS, proving the Terraform and GitOps
+setup is not k3s-specific. The AWS environment provisions a VPC, public and
+private subnets across two availability zones, a cost-conscious single NAT
+gateway, an EKS control plane, a managed node group, and Argo CD through the
+shared Terraform bootstrap module.
+
+**Implemented:**
+- EKS Kubernetes version pinned to `1.31`.
+- Worker nodes run in private subnets using `t3.micro` instances.
+- IAM roles and managed policies are defined for the EKS control plane and nodes.
+- Argo CD is exposed through a NodePort and configured for local HTTP access.
+- Argo CD was accessed through a local port-forward at `http://localhost:8080`.
+
+**Access the Argo CD UI:**
+```bash
+kubectl -n argocd port-forward svc/argocd-server 8080:80
+# Open http://localhost:8080
+```
+
+The first port-forward attempt reset its connection after the Kubernetes API
+upgrade succeeded. The pod remained healthy with zero restarts, and reconnecting
+established the tunnel successfully.
 
 ## Roadmap
 
 - [x] Phase 1 — Local GitOps loop (k3s + Terraform + ArgoCD)
-- [ ] Phase 2 — EKS provisioning via Terraform
-- [ ] Phase 3 — Same GitOps setup on EKS (multi-cloud proof)
+- [x] Phase 2 — EKS provisioning via Terraform
+- [x] Phase 3 — Same GitOps setup on EKS (multi-cloud proof)
 - [ ] Phase 4 — Metrics pipeline (metrics-server / Prometheus)
 - [ ] Phase 5 — AI analysis layer (Gemini-based rightsizing/scaling recommendations)
 - [ ] Phase 6 — Prophet-based predictive scaling, tying in undergraduate dissertation research

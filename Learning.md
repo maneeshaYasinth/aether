@@ -59,6 +59,53 @@ But Kubernetes needs to be told *what* to run. Doing that by typing commands by 
 
 ---
 
-## Phase 2: EKS (cloud) — not yet started
+## Phase 2: EKS (cloud)
 
-Terraform will provision the actual Kubernetes cluster itself here (via AWS EKS), rather than just deploying software onto a pre-existing one. To be filled in as this phase progresses.
+The second phase moved the platform from a local k3s cluster to a real AWS EKS
+cluster. Unlike Phase 1, Terraform provisions the Kubernetes control plane and
+worker nodes here instead of installing software onto a cluster created by an
+external installer.
+
+### What I built
+
+- A VPC with DNS support and DNS hostnames enabled.
+- Public and private subnets across `us-east-1a` and `us-east-1b`.
+- EKS subnet tags for public load balancers and internal load balancers.
+- An internet gateway for public traffic and one NAT gateway for private nodes.
+- An EKS cluster pinned to Kubernetes `1.31`.
+- A managed node group using `t3.micro` instances in private subnets.
+- Separate IAM roles and managed policies for the EKS control plane and nodes.
+- Terraform Kubernetes and Helm providers authenticated through the EKS cluster
+  endpoint and `aws_eks_cluster_auth`.
+- The shared Argo CD bootstrap module, configured for NodePort access and plain
+  HTTP during local development.
+
+### What I verified
+
+1. Terraform created the AWS networking resources, EKS control plane, and managed
+   node group.
+2. Argo CD pods reached `Running` and `Ready` on the EKS cluster.
+3. The Argo CD UI was reached through:
+
+   ```bash
+   kubectl -n argocd port-forward svc/argocd-server 8080:80
+   ```
+
+4. The UI opened at `http://localhost:8080`.
+
+### Lessons and troubleshooting
+
+- EKS worker nodes belong in private subnets; the NAT gateway provides outbound
+  access without assigning public IP addresses to the nodes.
+- A single NAT gateway keeps this portfolio environment affordable, but it is a
+  single point of failure and is not the production multi-AZ design.
+- Argo CD was configured with `server.insecure: true`, so the local forwarded URL
+  uses HTTP rather than HTTPS.
+- `kubectl port-forward` can complete the API WebSocket upgrade and still lose
+  the connection afterward if the pod-side connection is reset. In this case the
+  Argo CD pod was healthy with zero restarts, and starting a fresh forward through
+  the Service worked:
+
+  ```bash
+  kubectl -n argocd port-forward svc/argocd-server 8080:80
+  ```
