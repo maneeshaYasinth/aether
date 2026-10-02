@@ -40,6 +40,10 @@ def main():
         result = call_gemini(build_prompt(snapshot))
 
     report = render_markdown(result, snapshot)
+    if not args.dry_run:
+        # Always log the full report: most findings aren't auto-editable, and
+        # without this they'd only be visible if a PR happened to be opened.
+        print(report)
     propose(result, report, dry_run=args.dry_run)
 
 
