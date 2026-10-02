@@ -21,8 +21,8 @@ spec:
           # giving the Phase 5 analyzer a clear rightsizing case to detect.
           resources:
             requests:
-              cpu: 250m
-              memory: 128Mi
+              cpu: 10m
+              memory: 32Mi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: 100m
+              memory: 64Mi
