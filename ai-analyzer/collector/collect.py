@@ -60,6 +60,32 @@ def load_usage(custom_api, namespace):
     return usage
 
 
+def resolve_workload(apps_api, pod, cache):
+    """Return the object a human actually edits in git, e.g. ("Deployment", "hello-nginx").
+
+    A Deployment's pods are owned by a ReplicaSet (hello-nginx-847949887d), which
+    is generated and never edited directly, so follow that one extra hop.
+    """
+    owners = pod.metadata.owner_references or []
+    if not owners:
+        return {"kind": "Pod", "name": pod.metadata.name}
+
+    owner = owners[0]
+    if owner.kind != "ReplicaSet":
+        # StatefulSet, DaemonSet, Job... already the thing you edit.
+        return {"kind": owner.kind, "name": owner.name}
+
+    key = (pod.metadata.namespace, owner.name)
+    if key not in cache:
+        rs = apps_api.read_namespaced_replica_set(owner.name, pod.metadata.namespace)
+        rs_owners = rs.metadata.owner_references or []
+        if rs_owners:
+            cache[key] = {"kind": rs_owners[0].kind, "name": rs_owners[0].name}
+        else:
+            cache[key] = {"kind": "ReplicaSet", "name": owner.name}
+    return cache[key]
+
+
 def collect(namespace=None, exclude=()):
     # Uses ~/.kube/config locally; falls back to the pod's service account
     # if this ever runs inside the cluster.
@@ -70,6 +96,8 @@ def collect(namespace=None, exclude=()):
 
     core_api = client.CoreV1Api()
     custom_api = client.CustomObjectsApi()
+    apps_api = client.AppsV1Api()
+    workload_cache = {}
 
     usage = load_usage(custom_api, namespace)
     if namespace:
@@ -83,7 +111,7 @@ def collect(namespace=None, exclude=()):
         if ns in exclude or pod.status.phase != "Running":
             continue
 
-        owner = pod.metadata.owner_references[0].kind if pod.metadata.owner_references else None
+        workload = resolve_workload(apps_api, pod, workload_cache)
 
         for spec in pod.spec.containers:
             resources = spec.resources
@@ -102,7 +130,7 @@ def collect(namespace=None, exclude=()):
                 "namespace": ns,
                 "pod": pod.metadata.name,
                 "container": spec.name,
-                "owner_kind": owner,
+                "workload": workload,
                 "cpu_millicores": {
                     "used": cpu_used,
                     "request": cpu_request,
