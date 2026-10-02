@@ -17,3 +17,12 @@ spec:
           image: nginx:1.27-alpine
           ports:
             - containerPort: 80
+          # Deliberately over-provisioned: nginx idles at ~0m CPU / ~4Mi memory,
+          # giving the Phase 5 analyzer a clear rightsizing case to detect.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
