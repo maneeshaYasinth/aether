@@ -132,7 +132,8 @@ aether/
 │   ├── root-app.yaml       # Parent Argo CD Application
 │   ├── apps/               # Child Argo CD Applications
 │   └── charts/              # Workload manifests
-├── ai-analyzer/            # Future metrics and AI analysis code
+├── ai-analyzer/            # Collector, Gemini analyzer, PR proposer (Phase 5)
+├── .github/workflows/      # Builds the analyzer container image
 ├── Learning.md             # Chronological learning notes
 ├── Readme.md               # Project overview and roadmap
 └── Aether-Learning-Guide.md
@@ -190,10 +191,16 @@ root-app
   |     +-- Service
   |
   +-- metrics-server Application
+  |     |
+  |     +-- Deployment
+  |     +-- Service
+  |     +-- APIService
+  |
+  +-- ai-analyzer Application
         |
-        +-- Deployment
-        +-- Service
-        +-- APIService
+        +-- CronJob
+        +-- ServiceAccount
+        +-- ClusterRole + ClusterRoleBinding
 ```
 
 The root Application is declared in [gitops/root-app.yaml](gitops/root-app.yaml). Child Applications are stored in `gitops/apps/`.
@@ -489,15 +496,20 @@ Completed:
 - Argo CD self-healing test.
 - AWS EKS infrastructure.
 - Metrics-server and current resource metrics.
+- The AI analyzer (collector, Gemini analyzer, PR proposer).
+- The analyzer image built by GitHub Actions and published to GHCR.
+- The analyzer running in-cluster as a read-only CronJob deployed by Argo CD.
+- A full AI → pull request → human merge → Argo CD loop (PR #1).
 
-Next milestone:
+The order changed from the original plan: the analyzer was built on metrics-server alone, because rightsizing only needs a current snapshot. Prometheus moves to Phase 6, where forecasting needs history.
+
+Next milestone (Phase 6):
 
 1. Install Prometheus through Argo CD.
 2. Confirm Prometheus is scraping Kubernetes metrics.
 3. Query historical CPU and memory data.
-4. Implement the `ai-analyzer/collector`.
-5. Send summarized metrics to Gemini.
-6. Produce explainable rightsizing recommendations.
+4. Feed history to the analyzer so recommendations can see peaks (higher confidence).
+5. Add Prophet-based forecasting in `ai-analyzer/forecaster/`.
 
 Metrics-server answers:
 
@@ -565,11 +577,40 @@ kubectl top pods -A
 
 Explain the path from `kubectl top` to the metrics-server pod.
 
+### Exercise 6: Prove the analyzer can't change the cluster
+
+```bash
+kubectl auth can-i list pods -A --as=system:serviceaccount:aether-analyzer:aether-analyzer
+kubectl auth can-i delete pods -n hello-nginx --as=system:serviceaccount:aether-analyzer:aether-analyzer
+kubectl auth can-i patch deployments -n hello-nginx --as=system:serviceaccount:aether-analyzer:aether-analyzer
+```
+
+Explain why the first is `yes` and the others are `no`, and which file in `gitops/charts/ai-analyzer/` decides that.
+
+### Exercise 7: Make the AI open a PR again
+
+Raise hello-nginx's requests in `gitops/charts/hello-nginx/deployment.yaml` (e.g. back to `250m` / `128Mi`), commit and push, wait for Argo CD to sync, then:
+
+```bash
+kubectl -n aether-analyzer create job --from=cronjob/aether-analyzer manual-test-pr
+kubectl -n aether-analyzer logs -f job/manual-test-pr
+```
+
+Find the new PR on GitHub. Before merging, check the diff: which lines changed, and were your comments preserved?
+
+### Exercise 8: Ship new analyzer code
+
+Make a small change in `ai-analyzer/` (for example, edit a log message). Follow it all the way through: commit → green GitHub Actions run → new `sha-` tag in GHCR → bump the tag in `cronjob.yaml` → Argo CD sync → manual Job. Explain why the CronJob doesn't use `latest`.
+
+### Exercise 9: Read a Gemini failure
+
+Read the logs of a run where Gemini was busy. For each line, say whether it was a 503 or a 429, what that code means, and why the script waited or moved on.
+
 ## 16. Interview explanation
 
 A concise explanation of the project is:
 
-> I built Aether as a Terraform and GitOps-based Kubernetes platform. Locally, k3s creates the cluster and Terraform installs Argo CD through the Helm provider. A root Argo CD Application watches a directory of child Applications, so workloads are deployed by committing manifests to Git. I proved self-healing by manually changing a Deployment and watching Argo restore the declared state. I also provisioned an AWS EKS environment with a VPC, private worker subnets, IAM roles, and the same Argo CD bootstrap module. Finally, I installed metrics-server through Argo CD and debugged a conflict with k3s's built-in metrics-server by tracing the Metrics API, Service endpoints, Deployment selectors, and pod readiness. The next step is Prometheus for historical metrics and an AI analyzer for rightsizing recommendations.
+> I built Aether as a Terraform and GitOps-based Kubernetes platform. Locally, k3s creates the cluster and Terraform installs Argo CD through the Helm provider. A root Argo CD Application watches a directory of child Applications, so workloads are deployed by committing manifests to Git. I proved self-healing by manually changing a Deployment and watching Argo restore the declared state. I also provisioned an AWS EKS environment with a VPC, private worker subnets, IAM roles, and the same Argo CD bootstrap module. I installed metrics-server through Argo CD and debugged a conflict with k3s's built-in metrics-server by tracing the Metrics API, Service endpoints, Deployment selectors, and pod readiness. On top of that I built an AI rightsizing analyzer: a Python CronJob running in the cluster under a read-only ServiceAccount collects live usage and resource requests, sends them to Gemini with explicit rules and a JSON schema, validates the answer in code, and opens a GitHub pull request. A human reviews and merges it, and Argo CD rolls it out. I proved the loop with a deliberately over-provisioned workload whose requests the AI cut from 250m/128Mi to 10m/32Mi. The design principle is that the AI proposes and a human approves — and that model output is treated as untrusted input. The next step is Prometheus history and Prophet forecasting.
 ```
 
 ## 17. Commands to remember
@@ -596,6 +637,17 @@ kubectl -n argocd port-forward svc/argocd-server 8080:80
 kubectl top nodes
 kubectl top pods -A
 
+# AI analyzer (in-cluster)
+kubectl -n aether-analyzer get cronjob,jobs,pods
+kubectl -n aether-analyzer create job --from=cronjob/aether-analyzer manual-test-N
+kubectl -n aether-analyzer logs -f job/manual-test-N
+
+# AI analyzer (laptop, from ai-analyzer/)
+.venv/bin/python run.py --dry-run
+
+# Which commit is Argo CD running?
+kubectl get application hello-nginx -n argocd -o jsonpath='{.status.sync.revision}'; echo
+
 # Terraform safety loop
 terraform fmt -check
 terraform validate
@@ -608,3 +660,34 @@ git add PATH
 git commit -m "type: description"
 git push origin main
 ```
+
+## 18. Phase 5 in one page
+
+Detailed explanations of every concept below are in `Learning.md` under *Phase 5*.
+
+```text
+CronJob (every 6h)
+  -> pod runs as ServiceAccount aether-analyzer (read-only RBAC)
+  -> collector: metrics.k8s.io usage + pod requests/limits, units normalised
+  -> analyzer:  Gemini with rules + JSON schema, backoff + model fallback
+  -> report printed to the pod logs
+  -> proposer:  validate -> edit allowed YAML -> GitHub PR (or no PR if nothing changes)
+  -> human merges -> Argo CD syncs -> rolling update
+```
+
+Where each piece lives:
+
+| Piece | Location |
+|---|---|
+| Python code | `ai-analyzer/collector`, `analyzer`, `proposer`, `run.py` |
+| Container image | `ai-analyzer/Dockerfile` → `ghcr.io/maneeshayasinth/aether-analyzer:sha-<commit>` |
+| Image build | `.github/workflows/analyzer-image.yml` |
+| Kubernetes objects | `gitops/charts/ai-analyzer/` (CronJob, ServiceAccount, ClusterRole, ClusterRoleBinding) |
+| Argo CD Application | `gitops/apps/ai-analyzer.yaml` |
+| Secret (not in Git) | `aether-analyzer-secrets` in namespace `aether-analyzer`: `GEMINI_API_KEY`, `GITHUB_TOKEN` |
+
+Three things to be able to explain:
+
+1. **Why a PR and not a direct change?** The analyzer can only read the cluster. A human reviews every change, Git keeps the history, and Argo CD stays the only thing that applies changes.
+2. **Why validate the AI's answer?** Model output is untrusted input. A weaker fallback model once recommended a no-op and contradicted itself; validation meant nothing happened.
+3. **Why low confidence?** One metrics-server snapshot can't see peaks. Prometheus history (Phase 6) fixes that.

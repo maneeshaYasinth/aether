@@ -33,13 +33,23 @@ aether/
 │   ├── root-app-aws.yaml     # app-of-apps entry point (EKS) — identical spec, different cluster
 │   ├── apps/                 # ArgoCD Application manifests (one per app ArgoCD should manage)
 │   │   ├── hello-nginx.yaml
-│   │   └── metrics-server.yaml
+│   │   ├── metrics-server.yaml
+│   │   └── ai-analyzer.yaml
 │   └── charts/
-│       └── hello-nginx/      # raw Deployment + Service YAML for the test app
-├── ai-analyzer/               # not yet built — Phase 5
-├── .github/workflows/         # not yet built — CI, will mirror GuardRail's plan-only pattern
-├── README.md
-├── learning.md                # beginner-level log of concepts learned, written for the person's own reference
+│       ├── hello-nginx/      # raw Deployment + Service YAML for the test app (now has resource requests/limits)
+│       └── ai-analyzer/      # cronjob.yaml + rbac.yaml (ServiceAccount, read-only ClusterRole, binding)
+├── ai-analyzer/               # Phase 5 — Python pipeline (see Phase 5 below)
+│   ├── collector/collect.py
+│   ├── analyzer/analyze.py
+│   ├── proposer/propose.py
+│   ├── run.py
+│   ├── requirements.txt       # kubernetes, ruamel.yaml
+│   └── Dockerfile
+├── .github/workflows/
+│   └── analyzer-image.yml     # builds + pushes analyzer image to GHCR (Terraform plan-only CI still not built)
+├── Readme.md
+├── Learning.md                # beginner-level log of concepts learned, written for the person's own reference
+├── Aether-Learning-Guide.md   # how it all fits together + practice exercises + interview explanation
 └── AGENT_CONTEXT.md           # this file
 ```
 
@@ -71,15 +81,24 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 - `hello-nginx` + `root-app-aws` deployed and proven Synced/Healthy on EKS — the actual "multi-cloud" proof
 - **All AWS resources were destroyed via `terraform destroy`** after Phase 2 was demonstrated, to stop hourly billing (NAT gateway, EKS control plane, LoadBalancer, EC2 nodes). Confirmed no orphaned load balancers/NAT gateways/clusters remained afterward. To resume Phase 2 work, `terraform apply` from `terraform/environments/aws` rebuilds everything from scratch (~15-20 min).
 
-**Phase 4 — Metrics pipeline: IN PROGRESS** (Phase 3 was effectively folded into Phase 2, since the GitOps-on-EKS proof happened there)
+**Phase 4 — Metrics pipeline: COMPLETE** (Phase 3 was effectively folded into Phase 2, since the GitOps-on-EKS proof happened there)
 - Decision made: start with `metrics-server` only (lightweight), defer Prometheus until Phase 6 (predictive scaling) actually needs historical time-series data
 - `gitops/apps/metrics-server.yaml` created — an ArgoCD Application pointing directly at the public `metrics-server` Helm chart repo (first time using that ArgoCD capability rather than a chart in this repo)
 - Uses `--kubelet-insecure-tls` because k3s's kubelet has a self-signed cert metrics-server doesn't trust by default — without this flag it installs but silently reports no real metrics
 - Being deployed to the **local k3s cluster** (not EKS, since EKS is currently torn down)
-- Status as of last session: manifest written, instructed to commit/push and verify via `kubectl get applications -n argocd` and `kubectl top nodes` / `kubectl top pods` — **verification not yet confirmed back to the assistant**
+- Verified 2026-10-02: `metrics-server` Synced/Healthy, `kubectl top nodes` / `kubectl top pods -A` return real numbers.
 
-**Phase 5 — AI analysis layer: NOT STARTED**
-- Planned: Google Gemini API (same as GuardRail), reading real metrics-server/Prometheus data and producing structured (JSON) rightsizing/scaling recommendations, posted as PR comments
+**Phase 5 — AI analysis layer: COMPLETE (2026-10-03)** — built in a Claude Code session
+- **Collector** (`ai-analyzer/collector/collect.py`): joins metrics.k8s.io usage with each container's requests/limits, normalises to millicores/MiB, computes % of request/limit, resolves pod → ReplicaSet → Deployment (`workload: {kind, name}`). Uses kubeconfig locally, in-cluster ServiceAccount otherwise.
+- **Analyzer** (`ai-analyzer/analyzer/analyze.py`): Gemini via raw REST (`urllib`, same style as GuardRail — no SDK). Explicit rules in the prompt (<20% of request = over-provisioned, ~2× usage, floors 10m CPU / 32Mi memory, memory limit ≥ 1.5× request), `responseSchema` for structured JSON, `temperature: 0.2`. `CONFIG_SOURCES` maps workloads to the file that declares them. Default model `gemini-3.8-flash` (`GEMINI_MODEL` env overrides); `gemini-2.5-flash` is retired for new keys. Exponential backoff (2/4/8/16s) on 429/503, then falls back to other Flash models from `GET /models`. `--dry-run` prints the prompt.
+- **Proposer** (`ai-analyzer/proposer/propose.py`): validates AI output (quantity regex, limit ≥ request), only edits files in `EDITABLE_MANIFESTS` (currently just `gitops/charts/hello-nginx/deployment.yaml`), uses ruamel.yaml to preserve comments, skips no-op edits, opens at most one open PR at a time (branch prefix `aether/rightsizing-`). GitHub REST API with `GITHUB_TOKEN`.
+- **run.py**: collect → Gemini → always print the full report → propose. `--dry-run`, `-i recs.json` (skip Gemini), `--exclude NS`.
+- **Proven loop**: hello-nginx deliberately set to 250m/128Mi (using ~0m/~10Mi) → PR #1 recommended 10m/32Mi (limits 100m/64Mi) → merged → Argo CD deployed merge commit `a41e55b` → pod replaced.
+- **Image**: `ai-analyzer/Dockerfile` (python:3.14-slim, non-root uid 10001) built by `.github/workflows/analyzer-image.yml` on changes to `ai-analyzer/**`; pushed to `ghcr.io/maneeshayasinth/aether-analyzer` with tags `sha-<short>` and `latest`. Package is public (inherited from the public repo), so no imagePullSecret.
+- **In-cluster**: `gitops/apps/ai-analyzer.yaml` → namespace `aether-analyzer`. CronJob `0 */6 * * *`, `concurrencyPolicy: Forbid`, `activeDeadlineSeconds: 600`, pinned image tag (currently `sha-82c549e`), hardened securityContext, read-only root FS with `/tmp` emptyDir. ClusterRole allows only get/list pods, get replicasets, get/list pods.metrics.k8s.io.
+- **Secret** `aether-analyzer-secrets` (`GEMINI_API_KEY`, `GITHUB_TOKEN`) was created by hand with kubectl and is NOT in Git. GitHub token is a fine-grained PAT named `aether-rightsizing-bot`: this repo only, Contents + Pull requests read/write, 90-day expiry — renew it and recreate the Secret when it expires.
+- **Rolling out analyzer code is two commits**: push code → wait for green CI → bump the `sha-` tag in `gitops/charts/ai-analyzer/cronjob.yaml`. Bumping before the image exists → `ImagePullBackOff`.
+- Last manual run (`manual-test-3`) completed: 15 containers, full report logged, correctly no PR (hello-nginx already rightsized; everything else is report-only).
 
 **Phase 6 — Prophet-based predictive scaling: NOT STARTED**
 - Ties into the person's undergraduate dissertation research (Prophet-based predictive auto-scaling for AWS Lambda) — a lightweight version of that logic would inform Aether's scaling recommendations
@@ -93,6 +112,24 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 2. **Per-node pod IP limit on `t3.micro`** — even after nodes launched, ArgoCD pods stayed `Pending` with "Too many pods" scheduling errors. AWS VPC CNI gives every pod a real VPC IP; `t3.micro`'s tiny ENI capacity caps it at ~4 pods/node including mandatory system pods. Fixed by scaling node count 2→4 (more small nodes, since bigger ones were blocked) AND trimming ArgoCD's Helm install (`dex.enabled=false`, `notifications.enabled=false`, `applicationSet.enabled=false` — though applicationset-controller still ran anyway, a minor chart-version quirk, not chased further since it wasn't causing resource pressure).
 3. **`kubectl port-forward` broken specifically on this EKS cluster** — "connection reset by peer" even pod-direct, with verbose logging (`-v=6`) showing it negotiates a WebSocket tunnel successfully but resets ~10s in. This is a known EKS websocket-tunneling compatibility quirk, not a config error. Fixed by switching ArgoCD's Service from `NodePort` to `LoadBalancer`, giving a real public AWS NLB hostname that bypasses `kubectl`'s tunneling entirely. Also had to use `http://` not `https://` when reaching it, since `configs.params.server.insecure=true` means ArgoCD speaks plain HTTP only, and the NLB is a pure L4 passthrough (no TLS termination) — using `https://` caused `PR_END_OF_FILE_ERROR` in the browser.
 4. **A Terraform state scare that turned out to be a non-issue** — a `terraform plan` once showed all 14 networking resources as "will create" instead of "no changes," which looked like state corruption (there was a near-empty `terraform.tfstate` next to a large `terraform.tfstate.backup`). Turned out the person had legitimately run `terraform destroy` before adding the EKS module — the empty state was correct, not corrupted. Worth remembering: always ask "did you destroy recently?" before assuming state corruption.
+
+5. **Gemini model retired** — `gemini-2.5-flash` returned 404 "no longer available to new users"; switched default to `gemini-3.8-flash`. GuardRail still references 2.5-flash (it has its own ListModels fallback, but worth updating).
+6. **Gemini overload/quota** — repeated 503 on 3.8-flash and 429 on fallback models; backoff + fallback eventually got an answer from `gemini-flash-lite-latest`, whose reasoning is vaguer (it once recommended a no-op "10m → 10m" and contradicted itself on coredns). Validation meant no bad PR was opened.
+7. **Workflow file never committed** — `git add .github/...` was run from inside `ai-analyzer/`, so the path didn't match; the push contained only the Dockerfile and Actions never ran. Run git from the repo root.
+8. **First in-cluster image pull took 56s**, making `kubectl logs -f` time out (`context deadline exceeded`) while the pod was still `ContainerCreating`. Not a failure; the next image version pulled in 5.6s (shared layers).
+9. **`kubectl create job --from=cronjob/...` copies the CronJob at that moment** — a job created before Argo CD synced the new tag ran the old image.
+10. **python3 -m venv failed** — Ubuntu needed `sudo apt install python3.14-venv`.
+
+---
+
+## Open items / next steps
+
+- **Small analyzer follow-ups** (not yet done): (a) treat recommendations whose values equal the current values as `ok` in code, so no-op rows disappear from the report; (b) on a quota-type 429, skip to the next model immediately instead of backing off ~30s per model.
+- **Stale comment** in `gitops/charts/hello-nginx/deployment.yaml` still says "Deliberately over-provisioned" though values are now 10m/32Mi.
+- **Argo CD Service type**: commit `2ee415b` changed the shared `argocd-bootstrap` module from NodePort to LoadBalancer (EKS fix). Not yet applied locally — applying on k3s would likely clash with Traefik on ports 80/443 and break `http://localhost:30080`. Should become a Terraform variable (NodePort for local, LoadBalancer for AWS).
+- Old test Jobs `manual-test-1/2/3` in `aether-analyzer` can be deleted: `kubectl -n aether-analyzer delete job manual-test-1 manual-test-2 manual-test-3`.
+- Future: Sealed Secrets / External Secrets for the analyzer Secret; Argo CD Image Updater for tag bumps; Terraform plan-only CI; auto-editing Helm values.
+- **Phase 6**: Prometheus via Argo CD for history, then Prophet forecasting in `ai-analyzer/forecaster/`.
 
 ---
 
