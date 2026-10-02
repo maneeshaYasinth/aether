@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aether-analyzer
+spec:
+  # Every 6 hours. Each run costs one Gemini call; it opens at most one PR at a time.
+  schedule: "0 */6 * * *"
+  # Never start a run while the previous one is still going.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # Kill a stuck run (e.g. Gemini retries) after 10 minutes.
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: aether-analyzer
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: analyzer
+              # Pinned to an exact CI build; bump the tag to roll out new analyzer code.
+              image: ghcr.io/maneeshayasinth/aether-analyzer:sha-d13e10b
+              # Secret is created by hand, never committed:
+              #   kubectl -n aether-analyzer create secret generic aether-analyzer-secrets \
+              #     --from-literal=GEMINI_API_KEY=... --from-literal=GITHUB_TOKEN=...
+              envFrom:
+                - secretRef:
+                    name: aether-analyzer-secrets
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              # Its own requests too, so the analyzer can rightsize itself.
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

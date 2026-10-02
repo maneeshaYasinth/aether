@@ -1,0 +1,39 @@
+# Identity for the analyzer pod. It can only READ what the collector needs;
+# it cannot change anything in the cluster. Changes go through GitHub PRs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aether-analyzer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aether-analyzer-read
+rules:
+  # Pod specs: requests, limits, owner references.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Follow pod -> ReplicaSet -> Deployment.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  # Live usage from metrics-server (what `kubectl top` reads).
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+# ClusterRole + ClusterRoleBinding (not Role + RoleBinding) because the
+# collector reads pods in every namespace, not just its own.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aether-analyzer-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aether-analyzer-read
+subjects:
+  - kind: ServiceAccount
+    name: aether-analyzer
+    namespace: aether-analyzer
