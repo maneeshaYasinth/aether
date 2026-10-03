@@ -348,3 +348,36 @@ kubectl -n aether-analyzer create secret generic aether-analyzer-secrets \
   --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
   --from-literal=GITHUB_TOKEN="$GITHUB_TOKEN"
 ```
+
+---
+
+## Housekeeping: one shared module, different settings per environment
+
+**Problem:** `argocd-bootstrap` is used by both `environments/local` (k3s) and `environments/aws` (EKS). To get a reachable Argo CD on EKS, the Service type was hardcoded to `LoadBalancer`, which silently changed local as well. On k3s, Traefik already holds ports 80/443 through k3s's built-in load balancer (ServiceLB/Klipper), so a second LoadBalancer Service fights it for those ports, and `http://localhost:30080` disappears.
+
+**Fix:** make the module take an *input variable* instead of a hardcoded value.
+
+```hcl
+# modules/argocd-bootstrap/variables.tf
+variable "server_service_type" {
+  type    = string
+  default = "NodePort"          # safe, free default
+  validation {
+    condition     = contains(["NodePort", "LoadBalancer", "ClusterIP"], var.server_service_type)
+    error_message = "..."
+  }
+}
+
+# environments/aws/main.tf
+module "argocd" {
+  source              = "../../modules/argocd-bootstrap"
+  server_service_type = "LoadBalancer"
+}
+```
+
+**Concepts:**
+- **A module is like a function; variables are its parameters.** If two callers need different behaviour, that difference should be a parameter, not an edit to the function body.
+- **Pick the default that's cheap and safe.** On AWS a LoadBalancer Service creates a real, billed ELB. With `NodePort` as the default, a paid resource only appears when an environment asks for one explicitly.
+- **`validation` blocks** catch typos (`"Loadbalancer"`) at `terraform plan` time instead of halfway through a Helm install.
+- **Port 30080 isn't in our code.** It's the argo-cd Helm chart's default `server.service.nodePortHttp`. Worth knowing so you don't hunt for it.
+- **Always read `terraform plan` before applying.** Here it also showed *unrelated* drift: an older commit (disabling dex/notifications/applicationSet) had never been applied to k3s. Plan shows the gap between code and reality, whatever caused it.

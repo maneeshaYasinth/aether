@@ -52,4 +52,6 @@ provider "helm" {
 
 module "argocd" {
   source = "../../modules/argocd-bootstrap"
+
+  server_service_type = "LoadBalancer"
 }

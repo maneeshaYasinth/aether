@@ -14,7 +14,7 @@ resource "helm_release" "argocd" {
 
   set {
     name  = "server.service.type"
-    value = "LoadBalancer"
+    value = var.server_service_type
   }
 
   set {
