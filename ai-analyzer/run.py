@@ -17,7 +17,7 @@ here = Path(__file__).resolve().parent
 for folder in ("collector", "analyzer", "proposer"):
     sys.path.insert(0, str(here / folder))
 
-from analyze import build_prompt, call_gemini, render_markdown  # noqa: E402
+from analyze import build_prompt, call_gemini, mark_noops, render_markdown  # noqa: E402
 from collect import collect  # noqa: E402
 from propose import propose  # noqa: E402
 
@@ -38,6 +38,7 @@ def main():
             result = json.load(f)
     else:
         result = call_gemini(build_prompt(snapshot))
+    mark_noops(result)
 
     report = render_markdown(result, snapshot)
     if not args.dry_run:

@@ -145,6 +145,22 @@ def retry_delay(error, attempt):
         return min(2 ** (attempt + 1), 60)
 
 
+def quota_exhausted(details):
+    """True when a 429 is a spent quota (daily cap, or a model with zero free-tier
+    quota) rather than a per-minute rate limit. Waiting won't fix the former, so
+    the caller should move straight to the next model.
+    """
+    try:
+        error = json.loads(details).get("error", {})
+    except (ValueError, AttributeError):
+        return False
+    for detail in error.get("details", []):
+        for violation in detail.get("violations", []):
+            if "PerDay" in violation.get("quotaId", "") or str(violation.get("quotaValue")) == "0":
+                return True
+    return False
+
+
 def fallback_models(api_key, preferred, limit=3):
     """Other Flash models this key can call, newest-looking first.
 
@@ -207,7 +223,9 @@ def call_gemini(prompt, max_retries=5):
                 return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
             except urllib.error.HTTPError as error:
                 details = error.read().decode("utf-8", errors="replace")
-                if error.code in (429, 503) and attempt < max_retries - 1:
+                if error.code == 429 and quota_exhausted(details):
+                    print(f"{model} quota exhausted, trying next model", file=sys.stderr)
+                elif error.code in (429, 503) and attempt < max_retries - 1:
                     delay = retry_delay(error, attempt)
                     print(f"{model} busy ({error.code}), retrying in {delay:.0f}s...", file=sys.stderr)
                     time.sleep(delay)
@@ -225,6 +243,41 @@ def call_gemini(prompt, max_retries=5):
                 print(f"Falling back to: {', '.join(models)}", file=sys.stderr)
 
     raise RuntimeError(f"All Gemini models failed ({'; '.join(errors)}). Try again in a few minutes.")
+
+
+def parse_quantity(value):
+    """Turn "50m", "0.05", "64Mi", "1Gi" into a number so equal values written
+    differently compare equal. Returns None if it doesn't look like a quantity.
+    """
+    units = {"m": 0.001, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "k": 1e3, "M": 1e6, "G": 1e9}
+    text = str(value).strip()
+    for suffix in sorted(units, key=len, reverse=True):
+        if text.endswith(suffix):
+            text, factor = text[: -len(suffix)], units[suffix]
+            break
+    else:
+        factor = 1
+    try:
+        return float(text) * factor
+    except ValueError:
+        return None
+
+
+def mark_noops(result):
+    """Models sometimes flag a container but "recommend" exactly its current values.
+    Relabel those as "ok" so they drop out of the report and the PR.
+    """
+    for rec in result["recommendations"]:
+        if rec["issue"] == "ok":
+            continue
+        current, recommended = rec.get("current") or {}, rec.get("recommended") or {}
+        proposed = {k: v for k, v in recommended.items() if quantity(v) != "—"}
+        if proposed and all(
+            parse_quantity(v) is not None and parse_quantity(v) == parse_quantity(current.get(k))
+            for k, v in proposed.items()
+        ):
+            rec["issue"] = "ok"
+    return result
 
 
 def quantity(value):
@@ -294,7 +347,7 @@ def main():
         print(prompt)
         return
 
-    result = call_gemini(prompt)
+    result = mark_noops(call_gemini(prompt))
 
     if args.output:
         with open(args.output, "w") as f:

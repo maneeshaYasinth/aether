@@ -318,7 +318,7 @@ If you bump the tag before the image exists, pods fail with `ImagePullBackOff`. 
 | Pushed, but no GitHub Action ran | `git add .github/...` was run from inside `ai-analyzer/`, so the path didn't exist and the workflow file was never committed | Git paths are relative to the current folder — run git from the repo root, check `git status` before committing |
 | `kubectl logs -f` → `context deadline exceeded` | The container was still pulling the image (56s first time) | Not a failure; `kubectl describe pod` → *Events* shows `Pulling` / `Pulled` |
 | `create job` → "already exists", logs had no report | `manual-test-2` was created before Argo CD synced the new image tag | Check the CronJob's image first, then use a new job name |
-| Gemini 429 on two fallback models (~60s wasted retrying) | Free-tier quota on those models | Known improvement: on a quota 429, skip to the next model immediately |
+| Gemini 429 on two fallback models (~60s wasted retrying) | Free-tier quota on those models | Fixed: on a quota 429 (daily cap or zero quota), skip to the next model immediately |
 
 ### Useful Phase 5 commands
 
@@ -381,3 +381,22 @@ module "argocd" {
 - **`validation` blocks** catch typos (`"Loadbalancer"`) at `terraform plan` time instead of halfway through a Helm install.
 - **Port 30080 isn't in our code.** It's the argo-cd Helm chart's default `server.service.nodePortHttp`. Worth knowing so you don't hunt for it.
 - **Always read `terraform plan` before applying.** Here it also showed *unrelated* drift: an older commit (disabling dex/notifications/applicationSet) had never been applied to k3s. Plan shows the gap between code and reality, whatever caused it.
+
+---
+
+## Housekeeping: two analyzer follow-ups
+
+**1. "Recommendations" that change nothing.** Sometimes Gemini labelled a container `over_provisioned` and then "recommended" exactly the values it already had. These are now relabelled `ok` in code (`mark_noops()` in `analyze.py`), so they drop out of the report and the PR.
+- **Don't trust the model for things code can check.** The prompt already says "use ok when nothing needs to change", but an LLM follows instructions *most* of the time. A deterministic check after the call costs nothing and is always right.
+- **Compare values, not strings.** `"10m"` and `"0.01"` are the same CPU; `"1Gi"` and `"1024Mi"` are the same memory. `parse_quantity()` converts both to plain numbers first.
+- It runs in `run.py` too, so saved recommendations (`-i recs.json`) get the same treatment.
+
+**2. Not all 429s are equal.** HTTP 429 "Too Many Requests" covers two different situations:
+
+| Kind | Example `quotaId` | Will waiting help? |
+|---|---|---|
+| Rate limit | `...PerMinute...` | Yes: back off and retry |
+| Quota exhausted | `...PerDay...`, or `quotaValue: "0"` (model not on free tier) | No: not for hours, or never |
+
+Google's error body has a `QuotaFailure` section that says which one it is. `quota_exhausted()` reads it, and for the second kind the code moves to the next model immediately instead of spending ~30s backing off on a model that can't answer.
+- **Lesson:** read the error *body*, not just the status code. The status says "something went wrong"; the body usually says what to do about it.
