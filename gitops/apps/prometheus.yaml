@@ -1,0 +1,45 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: prometheus
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: prometheus
+    targetRevision: 29.35.0
+    helm:
+      # Phase 6: usage *history* for the analyzer. The chart's default scrape
+      # config already includes kubernetes-nodes-cadvisor (per-container CPU and
+      # memory from the kubelet), which is all we need, so everything else is off.
+      values: |
+        alertmanager:
+          enabled: false
+        prometheus-pushgateway:
+          enabled: false
+        prometheus-node-exporter:
+          enabled: false
+        kube-state-metrics:
+          enabled: false
+        server:
+          retention: 15d
+          # Whichever limit hits first wins; keeps the 5Gi volume from filling.
+          retentionSize: 4GB
+          persistentVolume:
+            size: 5Gi
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
