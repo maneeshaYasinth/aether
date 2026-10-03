@@ -124,7 +124,6 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 
 ## Open items / next steps
 
-- **Argo CD local drift**: the Service type is now the `server_service_type` module variable (default `NodePort` for k3s; `aws/main.tf` passes `LoadBalancer`). The local `terraform plan` still shows one in-place change to the Helm release from commit `dc62cd3` (dex, notifications and applicationSet disabled; timeout 300→600) because it was never applied on k3s. Applying it removes those three components locally; harmless, since nothing uses them.
 - Old test Jobs `manual-test-1/2/3` in `aether-analyzer` can be deleted: `kubectl -n aether-analyzer delete job manual-test-1 manual-test-2 manual-test-3`.
 - Future: Sealed Secrets / External Secrets for the analyzer Secret; Argo CD Image Updater for tag bumps; Terraform plan-only CI; auto-editing Helm values.
 - **Phase 6**: Prometheus via Argo CD for history, then Prophet forecasting in `ai-analyzer/forecaster/`.

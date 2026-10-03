@@ -400,3 +400,5 @@ module "argocd" {
 
 Google's error body has a `QuotaFailure` section that says which one it is. `quota_exhausted()` reads it, and for the second kind the code moves to the next model immediately instead of spending ~30s backing off on a model that can't answer.
 - **Lesson:** read the error *body*, not just the status code. The status says "something went wrong"; the body usually says what to do about it.
+
+**Gotcha found while applying:** after the apply, dex and notifications were gone but the ApplicationSet controller was still running. In this chart version (10.9.2) there is no `applicationSet.enabled` key, and **Helm silently ignores values it doesn't recognise**, so no error appeared. The fix is `applicationSet.replicas = 0`. Lesson: after changing chart values, check the result (`kubectl get pods`) instead of trusting a green apply, and look up keys in `helm show values <chart> --version <v>` for the exact version you pin.

@@ -32,8 +32,10 @@ resource "helm_release" "argocd" {
     value = "false"
   }
 
+  # The chart has no applicationSet.enabled key (Helm silently ignores unknown
+  # values); scaling to zero is how this chart turns the controller off.
   set {
-    name  = "applicationSet.enabled"
-    value = "false"
+    name  = "applicationSet.replicas"
+    value = "0"
   }
 }
