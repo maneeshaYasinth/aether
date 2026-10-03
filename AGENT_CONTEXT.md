@@ -126,7 +126,7 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 
 - Old test Jobs `manual-test-1/2/3` in `aether-analyzer` can be deleted: `kubectl -n aether-analyzer delete job manual-test-1 manual-test-2 manual-test-3`.
 - Future: Sealed Secrets / External Secrets for the analyzer Secret; Argo CD Image Updater for tag bumps; Terraform plan-only CI; auto-editing Helm values.
-- **Phase 6**: Prometheus via Argo CD for history, then Prophet forecasting in `ai-analyzer/forecaster/`. Motivation seen in practice: back-to-back single-snapshot runs gave contradictory Argo CD advice (CPU 50m→10m, then 50m→100m), so Argo CD requests are deliberately left as set in `argocd-bootstrap` until history exists.
+- **Phase 6 (in progress)**: step 1 done on 2026-10-03: Prometheus runs via Argo CD (`gitops/apps/prometheus.yaml`, server only, cAdvisor scrape, 15d/4GB retention on a 5Gi local-path PVC, namespace `monitoring`). Deliberately paused to let history build up. **Next:** switch the collector to query Prometheus for per-container p95/max CPU and memory (fall back to metrics-server when history is short), and fold in two report fixes: (a) the table should show only fields that change, limits included (a redis row showed `10m → 10m | 32Mi → 32Mi` because the change was a hidden limit); (b) prompt rule "no CPU limit is intentional". Then Prophet forecasting in `ai-analyzer/forecaster/`. Motivation: back-to-back single-snapshot runs gave contradictory Argo CD advice (CPU 50m→10m, then 50m→100m), so Argo CD requests stay as set in `argocd-bootstrap` until history exists.
 
 ---
 
