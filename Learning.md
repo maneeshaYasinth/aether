@@ -390,6 +390,7 @@ module "argocd" {
 - **Don't trust the model for things code can check.** The prompt already says "use ok when nothing needs to change", but an LLM follows instructions *most* of the time. A deterministic check after the call costs nothing and is always right.
 - **Compare values, not strings.** `"10m"` and `"0.01"` are the same CPU; `"1Gi"` and `"1024Mi"` are the same memory. `parse_quantity()` converts both to plain numbers first.
 - It runs in `run.py` too, so saved recommendations (`-i recs.json`) get the same treatment.
+- Later extended: a row with **no** recommended values (Gemini saying "missing requests, but k3s manages this, leave it") is also relabelled `ok`. A recommendation you can't act on is noise.
 
 **2. Not all 429s are equal.** HTTP 429 "Too Many Requests" covers two different situations:
 

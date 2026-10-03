@@ -264,15 +264,16 @@ def parse_quantity(value):
 
 
 def mark_noops(result):
-    """Models sometimes flag a container but "recommend" exactly its current values.
-    Relabel those as "ok" so they drop out of the report and the PR.
+    """Models sometimes flag a container but "recommend" exactly its current values,
+    or no values at all (e.g. "missing requests, but k3s manages it, leave it").
+    Neither is actionable, so relabel them "ok" to drop them from the report and PR.
     """
     for rec in result["recommendations"]:
         if rec["issue"] == "ok":
             continue
         current, recommended = rec.get("current") or {}, rec.get("recommended") or {}
         proposed = {k: v for k, v in recommended.items() if quantity(v) != "—"}
-        if proposed and all(
+        if not proposed or all(
             parse_quantity(v) is not None and parse_quantity(v) == parse_quantity(current.get(k))
             for k, v in proposed.items()
         ):
