@@ -18,7 +18,7 @@ resource "helm_release" "argocd" {
   # pod, whereas a CPU limit would just throttle syncs.
   values = [yamlencode({
     controller = { resources = { requests = { cpu = "50m", memory = "256Mi" }, limits = { memory = "512Mi" } } }
-    repoServer = { resources = { requests = { cpu = "25m", memory = "64Mi" }, limits = { memory = "256Mi" } } }
+    repoServer = { resources = { requests = { cpu = "25m", memory = "128Mi" }, limits = { memory = "256Mi" } } }
     server     = { resources = { requests = { cpu = "10m", memory = "64Mi" }, limits = { memory = "128Mi" } } }
     redis      = { resources = { requests = { cpu = "10m", memory = "32Mi" }, limits = { memory = "64Mi" } } }
   })]
