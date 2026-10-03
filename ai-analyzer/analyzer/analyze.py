@@ -267,9 +267,15 @@ def mark_noops(result):
     """Models sometimes flag a container but "recommend" exactly its current values,
     or no values at all (e.g. "missing requests, but k3s manages it, leave it").
     Neither is actionable, so relabel them "ok" to drop them from the report and PR.
+    The same goes for anything k3s manages: we can't change it from this repo,
+    whatever numbers the model suggests.
     """
     for rec in result["recommendations"]:
         if rec["issue"] == "ok":
+            continue
+        # The prompt sends workloads as "Kind/name"; CONFIG_SOURCES keys on the name.
+        if config_source(rec["namespace"], rec["workload"].split("/")[-1]).startswith("managed by k3s"):
+            rec["issue"] = "ok"
             continue
         current, recommended = rec.get("current") or {}, rec.get("recommended") or {}
         proposed = {k: v for k, v in recommended.items() if quantity(v) != "—"}

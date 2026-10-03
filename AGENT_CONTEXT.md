@@ -126,7 +126,7 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 
 - Old test Jobs `manual-test-1/2/3` in `aether-analyzer` can be deleted: `kubectl -n aether-analyzer delete job manual-test-1 manual-test-2 manual-test-3`.
 - Future: Sealed Secrets / External Secrets for the analyzer Secret; Argo CD Image Updater for tag bumps; Terraform plan-only CI; auto-editing Helm values.
-- **Phase 6**: Prometheus via Argo CD for history, then Prophet forecasting in `ai-analyzer/forecaster/`.
+- **Phase 6**: Prometheus via Argo CD for history, then Prophet forecasting in `ai-analyzer/forecaster/`. Motivation seen in practice: back-to-back single-snapshot runs gave contradictory Argo CD advice (CPU 50m→10m, then 50m→100m), so Argo CD requests are deliberately left as set in `argocd-bootstrap` until history exists.
 
 ---
 
