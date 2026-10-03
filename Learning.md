@@ -411,3 +411,41 @@ Google's error body has a `QuotaFailure` section that says which one it is. `quo
 **Two more lessons from re-running the analyzer:**
 - **Models route around soft rules.** Once value-less rows were filtered, Gemini started giving k3s components real numbers while its own text still said "managed by k3s, leave it". Our code already knows what k3s owns (`CONFIG_SOURCES`), so those rows are now dropped by a hard check in `mark_noops()`. When the code knows the answer, let the code decide; the prompt is guidance, not enforcement.
 - **Single snapshots flip-flop.** Three runs a few minutes apart told us to cut the application controller's CPU to 10m, then 12m, then *raise* it to 100m; repo-server memory went "raise to 174Mi" then "cut to 64Mi". Each run reacts to whatever that one second looked like. Chasing it would mean changing values forever, so the Argo CD values stay as they are. Recommendations need history (p95/max over days), which is exactly what Phase 6's Prometheus is for.
+
+---
+
+## Phase 6: usage history with Prometheus
+
+### Why
+metrics-server only knows *right now*. Back-to-back analyzer runs gave contradictory advice because each saw a different second. Prometheus scrapes the same numbers every minute and **stores** them, so we can ask "what was the peak over the last 7 days?" instead of "what is it this second?".
+
+### What was deployed (`gitops/apps/prometheus.yaml`)
+- The `prometheus-community/prometheus` Helm chart, pinned (29.35.0), installed by Argo CD like metrics-server. Adding the file to `gitops/apps/` was enough: the root app picks up any new Application in that folder.
+- **Only the Prometheus server.** The chart can also install Alertmanager (sends alerts), Pushgateway (for batch jobs to push metrics), node-exporter (machine-level metrics) and kube-state-metrics (object state, e.g. requested resources). We don't need any of them yet, so they're off.
+- **Data source: cAdvisor.** It's built into the kubelet on every node and reports per-container CPU/memory. The chart's default scrape job `kubernetes-nodes-cadvisor` already collects it.
+- **Retention:** 15 days or 4GB, whichever comes first, on a 5Gi PersistentVolumeClaim.
+
+### Kubernetes concepts
+- **PersistentVolumeClaim (PVC):** a pod asking for disk that outlives the pod. On k3s the `local-path` StorageClass satisfies it with a folder on the laptop's disk.
+- **`WaitForFirstConsumer`:** the PVC stays `Pending` until a pod that uses it is scheduled, so the volume gets created on the node where the pod lands. `Pending` for the first few seconds is normal.
+- **Argo CD polls Git about every 3 minutes.** Right after a push the new app may not exist yet; press Refresh (or annotate the app) to skip the wait.
+- **`kubectl get -w` watches only one resource type:** `get pods -w` works, `get pods,pvc -w` errors.
+
+### Prometheus concepts
+- **Counter vs gauge.** `container_cpu_usage_seconds_total` only goes up (total CPU-seconds used), so you need `rate(...[5m])` to turn it into "cores in use". That needs several samples, so it returns nothing for the first few minutes. `container_memory_working_set_bytes` is a gauge (current value) and works immediately.
+- **Working set** is the memory number the kubelet uses for OOM/eviction decisions, and what `kubectl top` shows, so it's the one to size memory requests against.
+- **Filter `container!=""`:** cAdvisor also reports pod-level and node-level totals with an empty `container` label; skip them to avoid double counting.
+
+### Useful commands
+```bash
+# Is it scraping? (every job should be "up")
+kubectl get --raw /api/v1/namespaces/monitoring/services/prometheus-server:80/proxy/api/v1/targets | head -c 500
+
+# The UI: then open http://localhost:9090
+kubectl -n monitoring port-forward svc/prometheus-server 9090:80
+```
+Queries to try in the UI:
+```promql
+sum by (namespace) (container_memory_working_set_bytes{container!=""}) / 2^20
+sum by (namespace) (rate(container_cpu_usage_seconds_total{container!=""}[5m])) * 1000
+```
