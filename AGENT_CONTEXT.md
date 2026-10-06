@@ -34,12 +34,13 @@ aether/
 │   ├── apps/                 # ArgoCD Application manifests (one per app ArgoCD should manage)
 │   │   ├── hello-nginx.yaml
 │   │   ├── metrics-server.yaml
+│   │   ├── prometheus.yaml
 │   │   └── ai-analyzer.yaml
 │   └── charts/
 │       ├── hello-nginx/      # raw Deployment + Service YAML for the test app (now has resource requests/limits)
 │       └── ai-analyzer/      # cronjob.yaml + rbac.yaml (ServiceAccount, read-only ClusterRole, binding)
 ├── ai-analyzer/               # Phase 5 — Python pipeline (see Phase 5 below)
-│   ├── collector/collect.py
+│   ├── collector/collect.py   # + history.py (Prometheus p95/max, Phase 6)
 │   ├── analyzer/analyze.py
 │   ├── proposer/propose.py
 │   ├── run.py
@@ -100,7 +101,7 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 - **Rolling out analyzer code is two commits**: push code → wait for green CI → bump the `sha-` tag in `gitops/charts/ai-analyzer/cronjob.yaml`. Bumping before the image exists → `ImagePullBackOff`.
 - Last manual run (`manual-test-3`) completed: 15 containers, full report logged, correctly no PR (hello-nginx already rightsized; everything else is report-only).
 
-**Phase 6 — Prophet-based predictive scaling: NOT STARTED**
+**Phase 6 — Prometheus history + Prophet-based predictive scaling: IN PROGRESS** (see Open items)
 - Ties into the person's undergraduate dissertation research (Prophet-based predictive auto-scaling for AWS Lambda) — a lightweight version of that logic would inform Aether's scaling recommendations
 - This is the actual reason Prometheus (not just metrics-server) will eventually be needed — Prophet needs historical data points, a live snapshot isn't enough
 
@@ -119,6 +120,8 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 8. **First in-cluster image pull took 56s**, making `kubectl logs -f` time out (`context deadline exceeded`) while the pod was still `ContainerCreating`. Not a failure; the next image version pulled in 5.6s (shared layers).
 9. **`kubectl create job --from=cronjob/...` copies the CronJob at that moment** — a job created before Argo CD synced the new tag ran the old image.
 10. **python3 -m venv failed** — Ubuntu needed `sudo apt install python3.14-venv`.
+11. **k3s crash-loop after changing networks** — `node-ip` pinned in `/etc/rancher/k3s/config.yaml` to an old DHCP address → `failed to find interface with specified node ip`. Removed the pin (2026-10-06). The k3s service was also disabled, so it didn't start on boot; now enabled.
+12. **CronJob catch-up run races metrics-server at boot** → 503 from metrics.k8s.io; collector retries 503 now.
 
 ---
 
@@ -126,7 +129,7 @@ GitHub repo: `github.com/maneeshaYasinth/aether`, cloned locally at `~/Desktop/d
 
 - Old test Jobs `manual-test-1/2/3` in `aether-analyzer` can be deleted: `kubectl -n aether-analyzer delete job manual-test-1 manual-test-2 manual-test-3`.
 - Future: Sealed Secrets / External Secrets for the analyzer Secret; Argo CD Image Updater for tag bumps; Terraform plan-only CI; auto-editing Helm values.
-- **Phase 6 (in progress)**: step 1 done on 2026-10-03: Prometheus runs via Argo CD (`gitops/apps/prometheus.yaml`, server only, cAdvisor scrape, 15d/4GB retention on a 5Gi local-path PVC, namespace `monitoring`). Deliberately paused to let history build up. **Next:** switch the collector to query Prometheus for per-container p95/max CPU and memory (fall back to metrics-server when history is short), and fold in two report fixes: (a) the table should show only fields that change, limits included (a redis row showed `10m → 10m | 32Mi → 32Mi` because the change was a hidden limit); (b) prompt rule "no CPU limit is intentional". Then Prophet forecasting in `ai-analyzer/forecaster/`. Motivation: back-to-back single-snapshot runs gave contradictory Argo CD advice (CPU 50m→10m, then 50m→100m), so Argo CD requests stay as set in `argocd-bootstrap` until history exists.
+- **Phase 6 (in progress)**: step 1 done 2026-10-03: Prometheus runs via Argo CD (`gitops/apps/prometheus.yaml`, server only, cAdvisor scrape, 15d/4GB retention on a 5Gi local-path PVC, namespace `monitoring`). Step 2 code written 2026-10-06, **not yet verified live**: `ai-analyzer/collector/history.py` queries Prometheus (`PROMETHEUS_URL`, CronJob sets `http://prometheus-server.monitoring.svc`) for p95/max CPU+memory over 7d plus hours of coverage, grouped by workload via pod-name prefix; <24h history or Prometheus down → metrics-server snapshot (`usage_basis` per container). Prompt sizes requests ≈1.2× p95, memory limit ≥1.5× max, and says no CPU limit is intentional; report table now has a single "Changes" column of only the fields that change (limits included). PromQL not yet run against real Prometheus (no Docker access to test). **Found 2026-10-06: k3s service was disabled, so it didn't start after a reboot ~2026-10-04 and history has gaps** — `sudo systemctl enable --now k3s`. Verified 2026-10-06 against real Prometheus: queries work, every container reported 4.6h of history (so all still `snapshot`). k3s had also been crash-looping because `/etc/rancher/k3s/config.yaml` pinned an old Wi-Fi `node-ip`; removed so k3s follows the current interface. Catch-up CronJob runs at cluster start failed with metrics API 503 (metrics-server not ready); collector now retries 503 with backoff. `run.py --dry-run` now always prints the report. **To finish step 2:** push → wait for CI → bump the image `sha-` tag in `gitops/charts/ai-analyzer/cronjob.yaml`; keep k3s up ≥24h so containers switch to `usage_basis: history`. Then Prophet forecasting in `ai-analyzer/forecaster/`. Motivation: back-to-back single-snapshot runs gave contradictory Argo CD advice (CPU 50m→10m, then 50m→100m), so Argo CD requests stay as set in `argocd-bootstrap` until history exists.
 
 ---
 

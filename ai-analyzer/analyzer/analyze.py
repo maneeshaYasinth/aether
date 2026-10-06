@@ -32,6 +32,8 @@ DEFAULT_MODEL = "gemini-3.8-flash"
 CONFIG_SOURCES = {
     ("hello-nginx", "hello-nginx"): "gitops/charts/hello-nginx/deployment.yaml",
     ("kube-system", "metrics-server"): "gitops/apps/metrics-server.yaml (Helm values)",
+    ("monitoring", "prometheus-server"): "gitops/apps/prometheus.yaml (Helm values)",
+    ("aether-analyzer", "aether-analyzer"): "gitops/charts/ai-analyzer/cronjob.yaml",
     ("argocd", None): "terraform/modules/argocd-bootstrap/main.tf (Helm set values)",
     ("kube-system", None): "managed by k3s itself, not by this repo",
 }
@@ -101,6 +103,9 @@ def build_prompt(snapshot):
             "container": c["container"],
             "cpu_millicores": c["cpu_millicores"],
             "memory_mebibytes": c["memory_mebibytes"],
+            # .get(): snapshots saved before Phase 6 don't have these.
+            "usage_basis": c.get("usage_basis", "snapshot"),
+            "history_hours": c.get("history_hours", 0),
             "metrics_available": c["metrics_available"],
             "config_source": config_source(c["namespace"], workload["name"]),
         })
@@ -112,21 +117,28 @@ limit changes based on the usage data below.
 Data notes:
 - CPU is in millicores (1000 = 1 core), memory in MiB. All arithmetic is already done;
   use the numbers given rather than recalculating them.
-- null request/limit means none is set. null usage means metrics-server had no data.
-- This is ONE point-in-time snapshot from metrics-server ({snapshot["collected_at"]}),
-  not a history. Peaks are invisible, so never recommend cutting below a safe floor,
-  and lower your confidence accordingly.
+- null request/limit means none is set. null usage means there was no data.
+- Collected {snapshot["collected_at"]}. Source: {snapshot.get("source", "metrics-server snapshot")}.
+- usage_basis says what each container's numbers are based on:
+  - "history": "p95" is typical load and "max" the worst moment seen over
+    history_hours of real data; "used" is just this instant. pct_of_request uses p95,
+    pct_of_limit uses max. Base recommendations on p95 and max, not on "used".
+  - "snapshot": only "used" exists, one point in time. Peaks are invisible, so never
+    recommend cutting below a safe floor, and set confidence to low.
 - config_source says where the values are declared. If it says "managed by k3s",
   recommend leaving it alone unless there is a real problem.
 
 Rules:
-- Over-provisioned: usage under ~20% of request. Recommend a request of roughly
-  2x observed usage, with a floor of 10m CPU and 32Mi memory.
-- Under-provisioned: usage over ~80% of request or near the limit.
+- Over-provisioned: usage under ~20% of request. With history, recommend a request of
+  about 1.2x p95; with a snapshot, about 2x observed usage. Floors: 10m CPU, 32Mi memory.
+- Under-provisioned: usage over ~80% of request, or max near the limit.
 - Missing requests: the scheduler cannot place the pod sensibly and it is first to be
   evicted under pressure. Suggest starting values from observed usage.
-- Memory limits should be at least 1.5x the recommended memory request; going over a
-  memory limit kills the container, going over a CPU limit only throttles it.
+- Memory limits should be at least 1.5x the recommended memory request and, with
+  history, at least 1.5x max; going over a memory limit kills the container.
+- No CPU limit is intentional: going over a CPU limit only throttles, so many
+  workloads deliberately run without one. Never flag a missing CPU limit or
+  recommend adding one. Only change an existing CPU limit if max is close to it.
 - Write quantities in Kubernetes notation (e.g. "50m", "64Mi").
 - Include one entry per container, using issue "ok" when nothing needs to change.
 - Keep reasoning to 1-2 plain-English sentences that explain the why.
@@ -277,13 +289,35 @@ def mark_noops(result):
         if config_source(rec["namespace"], rec["workload"].split("/")[-1]).startswith("managed by k3s"):
             rec["issue"] = "ok"
             continue
-        current, recommended = rec.get("current") or {}, rec.get("recommended") or {}
-        proposed = {k: v for k, v in recommended.items() if quantity(v) != "—"}
-        if not proposed or all(
-            parse_quantity(v) is not None and parse_quantity(v) == parse_quantity(current.get(k))
-            for k, v in proposed.items()
-        ):
+        if not changes(rec):
             rec["issue"] = "ok"
+    return result
+
+
+FIELD_LABELS = {
+    "cpu_request": "CPU req",
+    "cpu_limit": "CPU limit",
+    "memory_request": "Mem req",
+    "memory_limit": "Mem limit",
+}
+
+
+def changes(rec):
+    """[(field, current, recommended)] for the values this recommendation really changes.
+
+    Skips fields left empty and ones equal to what's set (written either way:
+    "0.05" vs "50m"), so neither the table nor the PR shows "10m → 10m".
+    """
+    current, recommended = rec.get("current") or {}, rec.get("recommended") or {}
+    result = []
+    for field in FIELD_LABELS:
+        new = recommended.get(field)
+        if quantity(new) == "—":
+            continue
+        old = current.get(field)
+        if parse_quantity(new) is not None and parse_quantity(new) == parse_quantity(old):
+            continue
+        result.append((field, quantity(old), new))
     return result
 
 
@@ -304,8 +338,8 @@ def render_markdown(result, snapshot):
         "",
         result["summary"],
         "",
-        f"_Snapshot: {snapshot['collected_at']} · {len(snapshot['containers'])} containers · "
-        f"{len(actionable)} with recommendations_",
+        f"_{snapshot.get('source', 'metrics-server snapshot')} · {snapshot['collected_at']} · "
+        f"{len(snapshot['containers'])} containers · {len(actionable)} with recommendations_",
         "",
     ]
     if not actionable:
@@ -313,21 +347,19 @@ def render_markdown(result, snapshot):
         return "\n".join(lines) + "\n"
 
     lines += [
-        "| Severity | Workload | Issue | CPU req | Mem req | Confidence |",
-        "|---|---|---|---|---|---|",
+        "| Severity | Workload | Issue | Changes | Confidence |",
+        "|---|---|---|---|---|",
     ]
     for r in actionable:
-        cur, rec = r.get("current") or {}, r.get("recommended") or {}
-        cpu = f"{quantity(cur.get('cpu_request'))} → {quantity(rec.get('cpu_request'))}"
-        mem = f"{quantity(cur.get('memory_request'))} → {quantity(rec.get('memory_request'))}"
+        diff = "<br>".join(f"{FIELD_LABELS[f]} {old} → {new}" for f, old, new in changes(r))
         lines.append(
             f"| {r['severity']} | `{r['namespace']}/{r['workload']}` ({r['container']}) | "
-            f"{r['issue'].replace('_', ' ')} | {cpu} | {mem} | {r['confidence']} |"
+            f"{r['issue'].replace('_', ' ')} | {diff} | {r['confidence']} |"
         )
 
     lines += ["", "### Details", ""]
     for r in actionable:
-        lines.append(f"- **`{r['namespace']}/{r['workload']}`**: {r['reasoning']}")
+        lines.append(f"- **`{r['namespace']}/{r['workload']}`** ({r['container']}): {r['reasoning']}")
         if r.get("where_to_change"):
             lines.append(f"  - Change in: `{r['where_to_change']}`")
     return "\n".join(lines) + "\n"
@@ -338,6 +370,8 @@ def main():
     parser.add_argument("-i", "--input", help="collector snapshot JSON (default: collect live)")
     parser.add_argument("--exclude", action="append", default=[], metavar="NAMESPACE",
                         help="when collecting live, skip a namespace (repeatable)")
+    parser.add_argument("--prometheus", default=os.environ.get("PROMETHEUS_URL"),
+                        help="when collecting live, Prometheus URL for usage history")
     parser.add_argument("-o", "--output", help="write recommendations JSON here")
     parser.add_argument("--markdown", help="write a Markdown report here (PR-comment ready)")
     parser.add_argument("--dry-run", action="store_true", help="print the prompt and exit")
@@ -347,7 +381,7 @@ def main():
         with open(args.input) as f:
             snapshot = json.load(f)
     else:
-        snapshot = collect(exclude=set(args.exclude))
+        snapshot = collect(exclude=set(args.exclude), prometheus_url=args.prometheus)
 
     prompt = build_prompt(snapshot)
     if args.dry_run:

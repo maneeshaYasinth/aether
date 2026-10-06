@@ -6,10 +6,12 @@ Usage:
     python run.py --dry-run                    # show the diff + PR body, change nothing
     python run.py --exclude kube-system        # open a real PR (needs GEMINI_API_KEY, GITHUB_TOKEN)
     python run.py -i recs.json --dry-run       # reuse saved recommendations, skip Gemini
+    PROMETHEUS_URL=http://localhost:9090 python run.py --dry-run   # size from history
 """
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,11 +28,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--exclude", action="append", default=[], metavar="NAMESPACE",
                         help="skip a namespace (repeatable)")
+    parser.add_argument("--prometheus", default=os.environ.get("PROMETHEUS_URL"),
+                        help="Prometheus URL for usage history (default: $PROMETHEUS_URL)")
     parser.add_argument("-i", "--recommendations", help="use saved recommendations JSON instead of calling Gemini")
     parser.add_argument("--dry-run", action="store_true", help="print the diff and PR body; don't touch GitHub")
     args = parser.parse_args()
 
-    snapshot = collect(exclude=set(args.exclude))
+    snapshot = collect(exclude=set(args.exclude), prometheus_url=args.prometheus)
     print(f"Collected {len(snapshot['containers'])} containers", file=sys.stderr)
 
     if args.recommendations:
@@ -40,11 +44,11 @@ def main():
         result = call_gemini(build_prompt(snapshot))
     mark_noops(result)
 
+    # Always print the full report, dry run or not: most findings aren't
+    # auto-editable, and without this they'd only be visible if a PR happened
+    # to be opened.
     report = render_markdown(result, snapshot)
-    if not args.dry_run:
-        # Always log the full report: most findings aren't auto-editable, and
-        # without this they'd only be visible if a PR happened to be opened.
-        print(report)
+    print(report)
     propose(result, report, dry_run=args.dry_run)
 
 

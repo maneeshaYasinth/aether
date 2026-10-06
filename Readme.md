@@ -6,7 +6,7 @@ Aether provisions Kubernetes clusters (locally and on AWS EKS), deploys workload
 
 This is a follow-up to [GuardRail](#), a secure CI/CD pipeline for AWS infrastructure (Terraform + tfsec + AI-generated security summaries). Aether takes the same "AI reads real signal and explains it in plain English" idea further: from *explaining findings* to *recommending changes*.
 
-> **Status:** Phases 1–5 complete. The AI analyzer runs inside the cluster every 6 hours, reads live metrics, and opens rightsizing pull requests that a human reviews before Argo CD applies them. The EKS environment is torn down between sessions to avoid AWS charges and can be rebuilt with `terraform apply`. Next: Phase 6 (Prometheus history + Prophet forecasting).
+> **Status:** Phases 1–5 complete. The AI analyzer runs inside the cluster every 6 hours, reads live metrics, and opens rightsizing pull requests that a human reviews before Argo CD applies them. The EKS environment is torn down between sessions to avoid AWS charges and can be rebuilt with `terraform apply`. Phase 6 in progress: Prometheus stores usage history and the analyzer sizes from p95/max over 7 days; Prophet forecasting is next.
 
 ---
 
@@ -63,7 +63,7 @@ Infrastructure is provisioned with **Terraform** end to end — including the Gi
 | Cloud Kubernetes | AWS EKS |
 | Package management (K8s) | Helm |
 | GitOps / continuous deployment | ArgoCD |
-| Metrics | metrics-server (Prometheus planned for Phase 6) |
+| Metrics | metrics-server (live), Prometheus (history, cAdvisor scrape) |
 | AI analysis | Google Gemini API (REST, schema-enforced JSON output) |
 | Analyzer runtime | Python 3.14, Kubernetes Python client, ruamel.yaml |
 | Container image | Docker, GitHub Container Registry (GHCR) |
@@ -225,6 +225,14 @@ kubectl -n aether-analyzer logs -f job/manual-run
 ```
 
 **Known limitations:** a single metrics-server snapshot can't see traffic peaks, so all recommendations are low confidence; only `gitops/charts/hello-nginx` is auto-editable (Helm- and Terraform-managed values are report-only); the Secret is created by hand rather than managed through GitOps.
+
+## Phase 6: Usage history and forecasting — in progress
+
+A single snapshot can't see peaks: back-to-back runs gave contradictory advice for the same workload. Phase 6 adds history.
+
+- **Prometheus** ([gitops/apps/prometheus.yaml](gitops/apps/prometheus.yaml)) runs in `monitoring` via Argo CD: server only, scraping per-container CPU/memory from cAdvisor, 15 days / 4GB retention on a 5Gi volume.
+- **History-aware collector** ([collector/history.py](ai-analyzer/collector/history.py)): per-container p95 and max over 7 days, grouped by workload so history survives rollouts. Requests are sized from p95, memory limits from max. Containers with under 24h of data, or any run where Prometheus is unreachable, fall back to the metrics-server snapshot.
+- **Next:** Prophet forecasting (`ai-analyzer/forecaster/`) to size for expected load, not just past load.
 
 ## Roadmap
 

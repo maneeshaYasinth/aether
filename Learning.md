@@ -449,3 +449,43 @@ Queries to try in the UI:
 sum by (namespace) (container_memory_working_set_bytes{container!=""}) / 2^20
 sum by (namespace) (rate(container_cpu_usage_seconds_total{container!=""}[5m])) * 1000
 ```
+
+### Step 2: sizing from history instead of a snapshot
+
+**What changed:** the collector asks Prometheus for each container's **p95** and **max** CPU/memory over the last 7 days (new file `ai-analyzer/collector/history.py`), and Gemini sizes requests from p95 and limits from max.
+
+**p95 vs max, and why both:**
+- **p95** = the value usage stays under 95% of the time. It's "normal busy", ignoring rare spikes, so it's what a **request** should be based on (requests are what the scheduler reserves).
+- **max** = the single worst moment. That's what the **memory limit** must survive, because going over a memory limit kills the container (OOMKilled). Going over a CPU limit only slows it down (throttling).
+- That's also why "no CPU limit" is now treated as a deliberate choice, not a problem: without a CPU limit a container can borrow idle CPU, and nothing gets killed.
+
+**PromQL concepts:**
+- **Subquery `(...)[7d:5m]`:** "evaluate the inner expression every 5 minutes over the last 7 days". It turns a rate (which is only a value *now*) into a series of values you can then summarise.
+- **`quantile_over_time(0.95, ...)` / `max_over_time(...)`:** take a series over time and reduce it to one number per container.
+- **`count_over_time(...)`:** how many of those 5-minute points had data. Points × 5 minutes = hours of real history. Gaps (laptop asleep, k3s stopped) don't count.
+- **`sum by (namespace, pod, container)`:** collapse duplicate series for the same container (cAdvisor sometimes keeps an old one around after a restart).
+
+**Pods come and go, workloads stay.** Every rollout creates new pods with new random names (`hello-nginx-847949887d-x2x7p`). If history were keyed by pod, it would reset every time a rightsizing PR merged. Old pods can't be looked up anymore, but their names start with the workload name, so the collector groups history by that prefix (longest match wins, so `foo-bar-…` isn't credited to `foo`).
+
+**Fallback, never failure:** under 24h of history (can't include a daily peak), or Prometheus unreachable → that container uses the metrics-server snapshot like before, and the prompt tells Gemini to keep confidence low. A run never fails because of history.
+
+**Cluster DNS:** inside the cluster, the analyzer reaches Prometheus at `http://prometheus-server.monitoring.svc` (`<service>.<namespace>.svc`). It's a plain HTTP call to a Service, not a Kubernetes API call, so no RBAC change was needed.
+
+**Report fix:** the table used to show only CPU/memory *requests*, so a change that was really to a limit looked like `10m → 10m`. It now has one "Changes" column listing only the fields that actually change, limits included.
+
+**Problem hit:** k3s was installed with its service **disabled**, so after the laptop rebooted it didn't start, and Prometheus collected nothing for days. "Let history accumulate" only works if the cluster is running. Fix: `sudo systemctl enable --now k3s` (start now *and* on every boot).
+
+**Problem hit: k3s crash-looped on start.** `systemctl status k3s` showed `activating (auto-restart)`: start, die after ~10s, repeat. Hundreds of "connection refused" log lines hid the real one: `failed to find interface with specified node ip`. `/etc/rancher/k3s/config.yaml` pinned `node-ip: 10.165.32.246`, an address from an earlier Wi-Fi network; the laptop was now `192.168.8.140`. k3s uses the node IP to pick the network card for pod networking (flannel), so with no such card it quits. Fix: delete the `node-ip` line so k3s uses whatever interface has the default route. Lesson: on a laptop, never pin an IP that DHCP hands out; and when a log is flooded, grep for `fatal|Shutdown` rather than reading the errors at the top.
+
+**Problem hit: CronJob runs failed right after boot.** A CronJob that missed its schedule while the cluster was off runs **once, as soon as the cluster starts**. That catch-up run hit the metrics API before metrics-server was ready → `503 Service Unavailable` → job failed (and its one retry failed the same way seconds later). Fix: the collector now retries a 503 with backoff (5, 10, 20, 40, 60s). Other errors such as 403 still fail at once, since waiting won't fix a permission problem.
+
+```bash
+# Run the pipeline with history from the laptop (in ai-analyzer/)
+kubectl -n monitoring port-forward svc/prometheus-server 9090:80     # terminal 1
+.venv/bin/python collector/collect.py --prometheus http://localhost:9090 | less   # terminal 2: check usage_basis / history_hours
+PROMETHEUS_URL=http://localhost:9090 .venv/bin/python run.py --dry-run
+```
+```promql
+# hours of history per container (what the collector checks against 24)
+count_over_time((sum by (namespace, pod, container) (container_memory_working_set_bytes{container!="",container!="POD"}))[7d:5m]) * 5 / 60
+```

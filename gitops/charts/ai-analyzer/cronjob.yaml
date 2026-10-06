@@ -33,6 +33,11 @@ spec:
               envFrom:
                 - secretRef:
                     name: aether-analyzer-secrets
+              env:
+                # Usage history (Phase 6). Cluster DNS: <service>.<namespace>.svc;
+                # the chart's Service listens on port 80.
+                - name: PROMETHEUS_URL
+                  value: http://prometheus-server.monitoring.svc
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
