@@ -26,7 +26,7 @@ spec:
           containers:
             - name: analyzer
               # Pinned to an exact CI build; bump the tag to roll out new analyzer code.
-              image: ghcr.io/maneeshayasinth/aether-analyzer:sha-9ce1b81
+              image: ghcr.io/maneeshayasinth/aether-analyzer:sha-9e2b1e2
               # Secret is created by hand, never committed:
               #   kubectl -n aether-analyzer create secret generic aether-analyzer-secrets \
               #     --from-literal=GEMINI_API_KEY=... --from-literal=GITHUB_TOKEN=...
