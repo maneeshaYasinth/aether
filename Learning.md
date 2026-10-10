@@ -493,3 +493,183 @@ PROMETHEUS_URL=http://localhost:9090 .venv/bin/python run.py --dry-run
 # hours of history per container (what the collector checks against 24)
 count_over_time((sum by (namespace, pod, container) (container_memory_working_set_bytes{container!="",container!="POD"}))[7d:5m]) * 5 / 60
 ```
+
+---
+
+## Aether from A to Z (the whole system in one pass)
+
+Everything above is organised by phase, in the order I built it. This section is organised by **how the system actually works when it runs**, so I can explain it end to end without jumping between phases.
+
+### Layer 0: the machine
+- **Local:** an Ubuntu laptop. k3s runs as a **systemd service** (`systemctl status k3s`, logs with `journalctl -u k3s`). If the service isn't enabled, or the laptop sleeps, the whole cluster stops: no pods, no Prometheus scrapes, no CronJob runs.
+- **AWS:** EC2 instances (`t3.micro`) in a managed node group. AWS runs the control plane; I only pay for and see the worker nodes.
+
+### Layer 1: the network (AWS only, `modules/networking`)
+```
+Internet
+   │
+Internet Gateway ── public subnets (1a, 1b) ── NAT gateway (one, in a public subnet)
+                                                    │  outbound only
+                                     private subnets (1a, 1b) ── EKS worker nodes
+```
+- **VPC** = my own private network inside AWS. DNS support/hostnames on, because EKS needs them.
+- **Public subnet** = its route table sends `0.0.0.0/0` to the **Internet Gateway**. Load balancers live here.
+- **Private subnet** = its route table sends `0.0.0.0/0` to the **NAT gateway**. Nodes can download images and call AWS APIs, but nothing on the internet can start a connection to them.
+- **Two AZs** because EKS requires subnets in at least two Availability Zones.
+- **Subnet tags** (`kubernetes.io/role/elb`, `kubernetes.io/role/internal-elb`) tell AWS which subnets to put public vs internal load balancers in.
+- **One NAT gateway** saves money, but if that AZ goes down, the private subnets in the other AZ lose internet access too.
+
+### Layer 2: the cluster
+- **Local:** k3s's installer creates the cluster. Terraform does *not*.
+- **AWS:** Terraform creates it (`modules/eks-cluster`): an IAM role for the control plane, an IAM role for the nodes (worker, ECR read-only, CNI policies), the `aws_eks_cluster`, and an `aws_eks_node_group`.
+- **Pod networking differs:** k3s uses **flannel** (pods get IPs from a private overlay range). EKS uses the **AWS VPC CNI** (every pod gets a real VPC IP from the node's network interfaces), which is why a `t3.micro` could only fit ~4 pods.
+- **How I talk to it:** `kubectl` reads `~/.kube/config`. For k3s that's a static file with a certificate. For EKS, `aws eks update-kubeconfig` writes an entry that asks AWS for a short-lived token every time, and Terraform does the same with `aws_eks_cluster_auth`. Whoever created the EKS cluster is made admin automatically.
+
+### Layer 3: the GitOps engine
+1. `terraform apply` in `environments/local` (or `aws`) runs the shared `argocd-bootstrap` module: a namespace + a Helm release of Argo CD.
+2. I `kubectl apply` **one** file by hand, once: `gitops/root-app.yaml`.
+3. From then on, Argo CD polls GitHub (~every 3 min). `root-app` watches `gitops/apps/`; every Application file in there points at something to deploy (a folder in this repo or a public Helm chart).
+4. `automated: prune + selfHeal`: anything added to Git is created, anything removed is deleted, any manual change in the cluster is reverted.
+
+**So the only ways to change the running system are:** a Git commit (normal path), Terraform (for Argo CD itself and AWS), or a hand-made Secret (the one exception).
+
+### Layer 4: the workloads
+| App (`gitops/apps/`) | What it is | Source |
+|---|---|---|
+| `hello-nginx` | Test app: Deployment + Service | `gitops/charts/hello-nginx` (raw YAML) |
+| `metrics-server` | Live CPU/memory → Metrics API → `kubectl top` | public Helm chart |
+| `prometheus` | Scrapes cAdvisor every minute, stores 15 days | public Helm chart |
+| `ai-analyzer` | CronJob + RBAC for the analyzer | `gitops/charts/ai-analyzer` |
+
+### Layer 5: the analyzer loop (every 6 hours)
+1. **CronJob fires** → creates a Job → creates a pod running `ghcr.io/maneeshayasinth/aether-analyzer:sha-…`. k3s pulls the image (public, so no credentials).
+2. Pod starts as ServiceAccount `aether-analyzer`. Env vars come from the hand-made Secret (Gemini key, GitHub token).
+3. **Collect:** lists all pods (Kubernetes API, allowed by the read-only ClusterRole), reads live usage (Metrics API), asks Prometheus for 7-day p95/max (plain HTTP to `prometheus-server.monitoring.svc`, found via cluster DNS). Converts units, works out pod → ReplicaSet → Deployment.
+4. **Analyze:** builds a prompt with fixed sizing rules, calls Gemini's REST API with a JSON schema. Retries with backoff; falls back to other models on 404/429/503/timeout.
+5. **Check in code:** drop no-op rows and rows for k3s-managed things; validate quantities; limit ≥ request.
+6. **Propose:** if a change touches a file in `EDITABLE_MANIFESTS`, and no rightsizing PR is open, it creates a branch, commits the edited YAML, opens a PR via the GitHub API.
+7. **Human merges** → Argo CD sees the new commit → applies the Deployment → Kubernetes does a rolling update (new ReplicaSet, new pod with the new resources).
+
+### Layer 6: shipping new analyzer code
+1. Push a change under `ai-analyzer/` → GitHub Actions builds the Docker image → pushes `sha-<commit>` and `latest` to GHCR.
+2. Wait for green, then commit the new tag in `gitops/charts/ai-analyzer/cronjob.yaml` → Argo CD updates the CronJob → the next run uses it.
+
+### The design rules that hold it together
+- Git is the source of truth; the cluster is made to match it.
+- The AI only **proposes**; a human approves; Argo CD applies.
+- AI output is untrusted input: anything code can check, code checks.
+- Least privilege everywhere: read-only ClusterRole, non-root container, single-repo token.
+- Cheap by default: NodePort over LoadBalancer, one NAT, tear AWS down when not in use.
+
+---
+
+## Where I'm weak: honest gaps in this project
+
+This list comes from what the project **doesn't** do yet, and from the parts I got working with help but would struggle to explain cold. For each: why it matters, what I'd say today, and how to close the gap.
+
+### 1. Terraform state and team workflow (high priority)
+- **Gap:** state is a local `terraform.tfstate` file on my laptop (git-ignored). No remote backend, no locking. The "all 14 resources will be created" scare happened because I didn't fully understand what state is.
+- **Why it matters:** in any team, state lives in a shared backend (an S3 bucket with locking) so two people can't apply at once and losing a laptop doesn't lose the infrastructure's record.
+- **What to learn:** what state stores and why Terraform needs it; S3 backend + locking; `terraform import`, `state mv`, `state rm`; drift (`plan -refresh-only`); why state can contain secrets.
+- **Close it:** move `environments/aws` to an S3 backend, and build the plan-only CI that's been on the list since the start (GitHub Actions running `fmt`, `validate`, `plan` on PRs, with AWS access through **OIDC**, not stored keys).
+
+### 2. AWS IAM beyond "attach a managed policy" (high priority)
+- **Gap:** I used AWS-managed policies on two roles. I haven't written a custom policy, used IAM for pods (**IRSA** or **EKS Pod Identity**), or managed who can access the cluster (EKS **access entries**). Cluster access worked only because I created it.
+- **Why it matters:** IAM is the core of AWS security. Expect questions like "how does a pod get AWS permissions without access keys?" and "difference between a role's trust policy and its permissions policy?"
+- **What to learn:** trust policy vs permissions policy; `sts:AssumeRole`; least privilege with conditions; IRSA (OIDC provider → role → ServiceAccount annotation); access entries.
+- **Close it:** when EKS is rebuilt, give one pod a role via IRSA (e.g. read one S3 bucket) and prove `aws sts get-caller-identity` from inside it shows the role.
+
+### 3. Networking, below the diagram (high priority)
+- **Gap:** I built the VPC, but security groups were all created by EKS, not by me. The `port-forward` failure on EKS was worked around with a LoadBalancer, not root-caused. No Ingress, no TLS, no DNS (Route 53).
+- **Why it matters:** "a pod can't reach X" is the most common real-world ticket.
+- **What to learn:** CIDR maths (how many IPs in a /24? why does AWS reserve 5?); security groups (stateful) vs NACLs (stateless); how a request reaches a pod (LB → node → Service → kube-proxy/iptables → pod); Service types; Ingress + an ALB controller; how cluster DNS resolves `svc.namespace.svc`.
+- **Close it:** add an Ingress for hello-nginx on k3s (Traefik is already there); on EKS, the AWS Load Balancer Controller with an ALB. Draw the packet path from browser to pod from memory.
+
+### 4. Secrets management
+- **Gap:** the analyzer's Secret is created by hand and is only base64. It's the one thing not in GitOps, and the GitHub token expires every 90 days.
+- **Close it:** External Secrets Operator reading from AWS Secrets Manager (pairs with IRSA in #2), or Sealed Secrets on k3s. Be ready to explain why base64 isn't encryption and what etcd encryption at rest is.
+
+### 5. Scaling and reliability (Kubernetes)
+- **Gap:** Aether does **rightsizing** (how big is each pod), not **autoscaling** (how many pods / nodes). No HPA, no Cluster Autoscaler/Karpenter, no liveness/readiness probes, no PodDisruptionBudgets, single replicas everywhere.
+- **Why it matters:** "how would you handle a traffic spike?" is a standard question, and probes are expected on any production workload.
+- **What to learn:** HPA (uses the same Metrics API I already run); readiness vs liveness vs startup probes; QoS classes (Guaranteed / Burstable / BestEffort, which follow from requests/limits); rolling update `maxSurge`/`maxUnavailable`.
+- **Close it:** add probes and an HPA to hello-nginx, load it with a simple tool, and watch replicas go up and down.
+
+### 6. Observability beyond "Prometheus stores numbers"
+- **Gap:** no dashboards (Grafana), no alerts (Alertmanager is turned off), no central logs, nothing tells me when a CronJob run fails; I find out by checking.
+- **What to learn:** the three pillars (metrics, logs, traces); writing an alert rule; CloudWatch Container Insights on EKS; the "four golden signals" (latency, traffic, errors, saturation).
+- **Close it:** turn on Alertmanager with one rule: "the analyzer Job failed" or "no successful run in 13 hours".
+
+### 7. Testing and code quality
+- **Gap:** the analyzer has **no automated tests**. CI only builds the image. Correctness was checked by running it against the real cluster.
+- **Why it matters:** the validation logic (quantity parsing, no-op detection, limit ≥ request) is exactly the kind of thing that should have unit tests, and a reviewer will look for them.
+- **Close it:** `pytest` tests for `parse_quantity`, `mark_noops`, and the proposer's validation, run in the existing workflow before the image is built. Add image scanning (e.g. Trivy) to the same workflow.
+
+### 8. AWS breadth
+- **Gap:** this project touches VPC, EC2, EKS, IAM and ELB only. Not used: S3, RDS, CloudWatch, Route 53, ECR, Secrets Manager, Lambda, Auto Scaling groups directly, Cost Explorer/Budgets.
+- **Close it:** the gap fixes above already pull in S3 (state), Secrets Manager (#4), CloudWatch (#6) and ECR (could mirror the image there). Set an AWS **Budget** alert before the next EKS rebuild.
+
+### 9. Linux troubleshooting under pressure
+- **Gap:** the k3s crash-loop took a while because the real error was buried. I know `systemctl`/`journalctl` now, but not deeply.
+- **What to learn:** `journalctl -u <svc> -b --since`, filtering with `grep -E 'fatal|error'`; `ip addr`, `ip route`, `ss -tlnp`, `dig`, `curl -v`; `df -h` / `du` (Prometheus disk); file permissions and users (why UID 10001).
+
+### 10. Explaining code I didn't type myself
+- **Gap:** parts of the analyzer were written with an AI assistant. That's normal now, but in an interview "walk me through this function" has to get a confident answer.
+- **Close it:** for each of `collect.py`, `history.py`, `analyze.py`, `propose.py`, be able to say from memory: what goes in, what comes out, what can fail and what happens then. Re-read one file a week and explain it out loud.
+
+---
+
+## Self-check: can I answer these without notes?
+
+If I can't answer one in two or three sentences, that's a gap to study. Short answers are underneath each so I can check myself.
+
+**Kubernetes**
+1. What happens, step by step, after `kubectl apply` of a Deployment?
+   *API server validates and stores it in etcd → Deployment controller creates a ReplicaSet → ReplicaSet controller creates pods → scheduler picks a node with enough unrequested CPU/memory → kubelet on that node pulls the image and starts the container.*
+2. Request vs limit, and what happens when each is exceeded?
+   *Request = reserved, used for scheduling; exceeding it is allowed. Limit = cap; CPU over limit is throttled, memory over limit is OOMKilled.*
+3. Why does changing resources create a new pod?
+   *Pod specs are mostly immutable; a template change makes a new ReplicaSet and a rolling update.*
+4. Role vs ClusterRole?
+   *Role is one namespace; ClusterRole is cluster-wide or for cluster-scoped resources. The analyzer reads every namespace, so ClusterRole.*
+5. How does a pod find `prometheus-server.monitoring.svc`?
+   *Cluster DNS (CoreDNS) resolves the Service name to its ClusterIP; kube-proxy routes that IP to a ready pod.*
+
+**GitOps / CI/CD**
+6. What does self-heal do, and what does prune do?
+   *Self-heal reverts manual changes in the cluster to match Git; prune deletes resources that were removed from Git.*
+7. Why pin `sha-` tags instead of `latest`?
+   *You always know which code runs, a rollback is a Git revert, and `latest` can change without any commit.*
+8. Why can't GitHub Actions deploy to my k3s cluster directly?
+   *The laptop isn't reachable from the internet; pull-based GitOps works because Argo CD reaches out to GitHub, not the other way round.*
+
+**Terraform / AWS**
+9. What is Terraform state, and what goes wrong if two people apply at once without locking?
+   *The record mapping code to real resource IDs; without locking, both write state and one overwrites the other, so Terraform loses track of resources.*
+10. Why are worker nodes in private subnets, and how do they reach the internet?
+    *No public IPs, so nothing can connect in; outbound goes through the NAT gateway in a public subnet.*
+11. What's the risk of one NAT gateway?
+    *It's in one AZ; if that AZ fails, private subnets in every AZ lose outbound access.*
+12. Why did `t3.micro` nodes run out of room at ~4 pods?
+    *The VPC CNI gives every pod a real IP from the node's ENIs, and a t3.micro supports few ENIs/IPs.*
+13. Which AWS costs keep running if I forget to destroy?
+    *EKS control plane (hourly), NAT gateway (hourly + data), load balancers, EC2 nodes, EBS volumes, Elastic IPs.*
+
+**The AI part**
+14. Why does Python do the maths instead of the model?
+    *LLMs are unreliable at arithmetic; code is deterministic and testable.*
+15. Why size requests from p95 and memory limits from max?
+    *p95 is normal busy load to reserve for; max is the worst moment, and going over a memory limit kills the container.*
+16. What stops the AI from breaking the cluster?
+    *Read-only RBAC, validation in code, an allow-list of editable files, one PR at a time, and a human merge before Argo CD applies anything.*
+
+---
+
+## Suggested order to close the gaps
+
+1. Unit tests + Trivy scan in the existing workflow (free, local, quick win).
+2. Probes + HPA on hello-nginx, Ingress via Traefik (free, on k3s).
+3. Alertmanager rule for failed analyzer runs (free).
+4. Terraform plan-only CI with GitHub OIDC → AWS, S3 remote state (cents per month).
+5. Rebuild EKS **for one session**: IRSA, External Secrets + Secrets Manager, AWS Load Balancer Controller. Set a Budget alert first, then `terraform destroy` at the end.
+6. Then continue Phase 6 (Prophet forecasting).
