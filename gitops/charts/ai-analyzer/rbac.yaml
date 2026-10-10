@@ -18,6 +18,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["get"]
+  # Follow pod -> Job -> CronJob (the analyzer's own runs).
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get"]
   # Live usage from metrics-server (what `kubectl top` reads).
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]

@@ -483,6 +483,13 @@ sum by (namespace) (rate(container_cpu_usage_seconds_total{container!=""}[5m])) 
 
 **Surprise: history hours stopped growing at ~24h.** The 7-day window *slides*: every new hour that comes in, the hour from exactly 7 days ago drops out. Our oldest data (about 4h from Oct 3–4) was falling off the back as fast as new data arrived, so the total sat at 23.9h. Checked by splitting the window: `[1d:5m] offset 6d` (the oldest day) had 4.0h, `[6d:5m]` had 19.9h. Once that old data has fully aged out, the total grows again. Also: a sleeping laptop freezes k3s, so history and CronJob runs only happen while it's awake.
 
+**Result: the first history-based report (2026-10-10, 24.4h of history).** Confidence went from `low` to `high`, and the advice stopped flip-flopping:
+- **repo-server memory:** snapshot runs said "cut 128Mi → 64Mi", then "raise to 200Mi" (it had caught a spike). History: p95 78Mi against a 128Mi request, so no change. Settled.
+- **argocd-server memory:** a real problem no snapshot noticed. p95 66.5Mi is already *above* the 64Mi request, and the max of 120.7Mi was 94% of the 128Mi limit, close to an OOMKill. Recommended 128Mi request / 256Mi limit.
+- **prometheus-server CPU:** p95 6.3m but max 95m (spiky). The request goes to 10m anyway: the request is the *typical* reservation, and with no CPU limit the spikes simply borrow idle CPU.
+
+**Job → CronJob.** A CronJob creates a new Job for every run (`aether-analyzer-29860230`), and the Job creates the pod. The collector followed pod → Job and stopped, so each run looked like a brand-new workload with no config file. It now does one more hop to the CronJob, like ReplicaSet → Deployment (and needed `get jobs` added to the ClusterRole). Caveat: the analyzer only runs ~1 minute every 6 hours, so it will take a very long time to reach 24h of history; a time threshold suits long-running pods better than batch jobs.
+
 ```bash
 # Run the pipeline with history from the laptop (in ai-analyzer/)
 kubectl -n monitoring port-forward svc/prometheus-server 9090:80     # terminal 1

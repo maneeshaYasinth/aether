@@ -85,29 +85,35 @@ def load_usage(custom_api, namespace, retries=5):
     return usage
 
 
-def resolve_workload(apps_api, pod, cache):
+def resolve_workload(apps_api, batch_api, pod, cache):
     """Return the object a human actually edits in git, e.g. ("Deployment", "hello-nginx").
 
-    A Deployment's pods are owned by a ReplicaSet (hello-nginx-847949887d), which
-    is generated and never edited directly, so follow that one extra hop.
+    Some owners are generated and never edited directly, so follow one extra hop:
+    a Deployment's pods belong to a ReplicaSet (hello-nginx-847949887d), and a
+    CronJob's pods belong to a Job made for that one run (aether-analyzer-29860230).
     """
     owners = pod.metadata.owner_references or []
     if not owners:
         return {"kind": "Pod", "name": pod.metadata.name}
 
     owner = owners[0]
-    if owner.kind != "ReplicaSet":
-        # StatefulSet, DaemonSet, Job... already the thing you edit.
+    readers = {
+        "ReplicaSet": apps_api.read_namespaced_replica_set,
+        "Job": batch_api.read_namespaced_job,
+    }
+    if owner.kind not in readers:
+        # StatefulSet, DaemonSet... already the thing you edit.
         return {"kind": owner.kind, "name": owner.name}
 
-    key = (pod.metadata.namespace, owner.name)
+    key = (pod.metadata.namespace, owner.kind, owner.name)
     if key not in cache:
-        rs = apps_api.read_namespaced_replica_set(owner.name, pod.metadata.namespace)
-        rs_owners = rs.metadata.owner_references or []
-        if rs_owners:
-            cache[key] = {"kind": rs_owners[0].kind, "name": rs_owners[0].name}
+        parent = readers[owner.kind](owner.name, pod.metadata.namespace)
+        parent_owners = parent.metadata.owner_references or []
+        if parent_owners:
+            cache[key] = {"kind": parent_owners[0].kind, "name": parent_owners[0].name}
         else:
-            cache[key] = {"kind": "ReplicaSet", "name": owner.name}
+            # A ReplicaSet or Job created by hand: that is what you'd edit.
+            cache[key] = {"kind": owner.kind, "name": owner.name}
     return cache[key]
 
 
@@ -122,6 +128,7 @@ def collect(namespace=None, exclude=(), prometheus_url=None, window="7d"):
     core_api = client.CoreV1Api()
     custom_api = client.CustomObjectsApi()
     apps_api = client.AppsV1Api()
+    batch_api = client.BatchV1Api()
     workload_cache = {}
 
     usage = load_usage(custom_api, namespace)
@@ -133,7 +140,7 @@ def collect(namespace=None, exclude=(), prometheus_url=None, window="7d"):
     # Resolve workloads first: history is grouped by workload, and that needs
     # to know every workload name in a namespace.
     running = [
-        (pod, resolve_workload(apps_api, pod, workload_cache))
+        (pod, resolve_workload(apps_api, batch_api, pod, workload_cache))
         for pod in pods
         if pod.metadata.namespace not in exclude and pod.status.phase == "Running"
     ]
