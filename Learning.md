@@ -481,6 +481,8 @@ sum by (namespace) (rate(container_cpu_usage_seconds_total{container!=""}[5m])) 
 
 **Problem hit: a run crashed on a Gemini timeout.** The retry code caught *HTTP errors* (a 503 is a reply: "I'm busy"). A timeout is different: no reply ever comes, and Python raises `TimeoutError`, which nothing caught, so the job died. Fix: treat timeouts and network errors as "this model isn't answering" and move to the next model. Not retrying the same model is deliberate: each hang costs the full wait (now 90s), and the job has a 10-minute deadline (`activeDeadlineSeconds: 600`), so 4 models × 90s still fits.
 
+**Surprise: history hours stopped growing at ~24h.** The 7-day window *slides*: every new hour that comes in, the hour from exactly 7 days ago drops out. Our oldest data (about 4h from Oct 3–4) was falling off the back as fast as new data arrived, so the total sat at 23.9h. Checked by splitting the window: `[1d:5m] offset 6d` (the oldest day) had 4.0h, `[6d:5m]` had 19.9h. Once that old data has fully aged out, the total grows again. Also: a sleeping laptop freezes k3s, so history and CronJob runs only happen while it's awake.
+
 ```bash
 # Run the pipeline with history from the laptop (in ai-analyzer/)
 kubectl -n monitoring port-forward svc/prometheus-server 9090:80     # terminal 1
