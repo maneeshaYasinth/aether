@@ -228,7 +228,7 @@ def call_gemini(prompt, max_retries=5):
         )
         for attempt in range(max_retries):
             try:
-                with urllib.request.urlopen(request, timeout=120) as response:
+                with urllib.request.urlopen(request, timeout=90) as response:
                     data = json.loads(response.read())
                 if model != preferred:
                     print(f"Note: answered by fallback model {model}", file=sys.stderr)
@@ -246,6 +246,13 @@ def call_gemini(prompt, max_retries=5):
                     # 400/401/403 mean our request or key is wrong; another model won't help.
                     raise RuntimeError(f"Gemini returned {error.code} for model {model}: {details}") from error
                 errors.append(f"{model}: {error.code}")
+                break
+            except (urllib.error.URLError, TimeoutError) as error:
+                # No answer at all (read timeout, DNS, connection reset). The wait
+                # already cost up to 90s of the job's 10-minute deadline, so move
+                # to the next model instead of waiting on this one again.
+                print(f"{model} did not respond ({error}), trying next model", file=sys.stderr)
+                errors.append(f"{model}: {error}")
                 break
 
         # Only look up fallbacks once, after the preferred model has failed.

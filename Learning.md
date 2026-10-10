@@ -479,6 +479,8 @@ sum by (namespace) (rate(container_cpu_usage_seconds_total{container!=""}[5m])) 
 
 **Problem hit: CronJob runs failed right after boot.** A CronJob that missed its schedule while the cluster was off runs **once, as soon as the cluster starts**. That catch-up run hit the metrics API before metrics-server was ready → `503 Service Unavailable` → job failed (and its one retry failed the same way seconds later). Fix: the collector now retries a 503 with backoff (5, 10, 20, 40, 60s). Other errors such as 403 still fail at once, since waiting won't fix a permission problem.
 
+**Problem hit: a run crashed on a Gemini timeout.** The retry code caught *HTTP errors* (a 503 is a reply: "I'm busy"). A timeout is different: no reply ever comes, and Python raises `TimeoutError`, which nothing caught, so the job died. Fix: treat timeouts and network errors as "this model isn't answering" and move to the next model. Not retrying the same model is deliberate: each hang costs the full wait (now 90s), and the job has a 10-minute deadline (`activeDeadlineSeconds: 600`), so 4 models × 90s still fits.
+
 ```bash
 # Run the pipeline with history from the laptop (in ai-analyzer/)
 kubectl -n monitoring port-forward svc/prometheus-server 9090:80     # terminal 1
